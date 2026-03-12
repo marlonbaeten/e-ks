@@ -21,13 +21,22 @@ services:
     environment:
       STORAGE_URL: memory://ephemeral
       BAG_SERVICE_URL: http://bag-service:8080
+      TYPST_URL: http://typst-webservice:8080
       LOAD_FIXTURES: "true"
     depends_on:
       - bag-service
     networks: [pw_network]
 
   bag-service:
-    image: ghcr.io/tweedegolf/bag-address-lookup:0.3.2
+    image: ghcr.io/tweedegolf/bag-address-lookup:0.3.5
+    networks: [pw_network]
+
+  typst-webservice:
+    image: ghcr.io/tweedegolf/typst-webservice:0.5.2
+    volumes:
+      - ../models:/templates:ro
+    environment:
+      TWS_DIR: /templates
     networks: [pw_network]
 
 networks:

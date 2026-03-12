@@ -4,7 +4,7 @@ COPY . ./assets/
 RUN find ./assets -type d -exec chmod 755 {} + && \
     find ./assets -type f -exec chmod 644 {} +
 
-FROM ghcr.io/tweedegolf/typst-webservice:0.5.1
+FROM ghcr.io/tweedegolf/typst-webservice:0.5.2
 
 ENV VERSION=dev
 
