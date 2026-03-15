@@ -12,12 +12,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use typst_webservice::PdfContext;
 
 const MODEL_FILE_PREFIX: &str = "model-";
-const MODEL_H_TEMPLATE_PREFIX: &str = "model-h";
-const MODEL_H_INPUT_PREFIX: &str = "model-h-";
-const FRY_TEMPLATE_SUFFIX: &str = "fry.typ";
-const NL_TEMPLATE_SUFFIX: &str = "nl.typ";
 const EXAMPLE_INPUTS_DIR: &str = "example-inputs";
-const DEFAULT_EXAMPLE_INPUT_FILE: &str = "example-1.json";
 const DIFF_PDF_BINARY: &str = "diff-pdf";
 const TMP_DIR_NAME: &str = "tmp";
 const MODELS_DIR_NAME: &str = "models";
@@ -26,16 +21,44 @@ const MAIN_MODELS_DIR_NAME: &str = "main-models";
 const DIFFS_DIR_NAME: &str = "diffs";
 const CURRENT_PDFS_DIR_NAME: &str = "current-pdfs";
 const MAIN_PDFS_DIR_NAME: &str = "main-pdfs";
-const GIT_MAIN_BRANCH: &str = "main";
-const PDF_FILE_EXTENSION: &str = "pdf";
+const GIT_MAIN_REF: &str = "origin/main";
 const RESULTS_FILE_NAME: &str = "results.md";
-const TABLE_TEMPLATE_HEADER: &str = "Template";
-const TABLE_STATUS_HEADER: &str = "Status";
-const TABLE_DIFF_HEADER: &str = "Diff";
-const STATUS_ADDED: &str = "added";
-const STATUS_DELETED: &str = "deleted";
-const STATUS_CHANGED: &str = "changed";
-const STATUS_IDENTICAL: &str = "identical";
+
+type DiffSummaryRow = (PathBuf, Option<String>, &'static str, Option<PathBuf>);
+
+struct WorkspacePaths {
+    tmp_dir: PathBuf,
+    models_dir: PathBuf,
+    current_root: PathBuf,
+    main_root: PathBuf,
+    diffs_root: PathBuf,
+    current_pdfs_root: PathBuf,
+    main_pdfs_root: PathBuf,
+    results_path: PathBuf,
+}
+
+impl WorkspacePaths {
+    /// Build the derived workspace paths used while generating and comparing PDFs.
+    fn new(project_dir: PathBuf) -> Self {
+        let tmp_dir = project_dir.join(TMP_DIR_NAME);
+        Self {
+            models_dir: project_dir.join(MODELS_DIR_NAME),
+            current_root: tmp_dir.join(CURRENT_MODELS_DIR_NAME),
+            main_root: tmp_dir.join(MAIN_MODELS_DIR_NAME),
+            diffs_root: tmp_dir.join(DIFFS_DIR_NAME),
+            current_pdfs_root: tmp_dir.join(CURRENT_PDFS_DIR_NAME),
+            main_pdfs_root: tmp_dir.join(MAIN_PDFS_DIR_NAME),
+            results_path: tmp_dir.join(RESULTS_FILE_NAME),
+            tmp_dir,
+        }
+    }
+}
+
+struct FileGroups {
+    new_files: Vec<PathBuf>,
+    deleted_files: Vec<PathBuf>,
+    common_files: Vec<PathBuf>,
+}
 
 /// Return whether a binary name resolves to an executable file somewhere on `PATH`.
 fn binary_in_path(name: &str) -> bool {
@@ -131,20 +154,43 @@ fn template_name(file: &Path) -> Result<String> {
 }
 
 /// Load the example JSON input associated with a model template from `example-inputs/`.
-async fn load_render_input(root: &Path, template: &str) -> Result<serde_json::Value> {
-    let template = template
-        .replace(MODEL_H_TEMPLATE_PREFIX, MODEL_H_INPUT_PREFIX)
-        .replace(FRY_TEMPLATE_SUFFIX, DEFAULT_EXAMPLE_INPUT_FILE)
-        .replace(NL_TEMPLATE_SUFFIX, DEFAULT_EXAMPLE_INPUT_FILE);
+async fn load_render_inputs(
+    root: &Path,
+    template: &str,
+) -> Result<Vec<(String, serde_json::Value)>> {
+    let prefix = template.replace(".typ", "");
 
-    let path = root.join(EXAMPLE_INPUTS_DIR).join(template);
+    let path = root.join(EXAMPLE_INPUTS_DIR);
 
-    let input = tokio::fs::read_to_string(&path)
-        .await
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    // loop trough `path` and collect all files with extension `.json` and name starting with `prefix`
+    let mut inputs = Vec::new();
 
-    serde_json::from_str(&input)
-        .with_context(|| format!("Failed to parse JSON from {}", path.display()))
+    for entry in std::fs::read_dir(&path)
+        .with_context(|| format!("Failed to read directory {}", path.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+
+            if file_name.starts_with(&prefix) {
+                let input = tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+
+                let json = serde_json::from_str(&input)
+                    .with_context(|| format!("Failed to parse JSON from {}", path.display()))?;
+
+                inputs.push((file_name, json));
+            }
+        }
+    }
+
+    Ok(inputs)
 }
 
 /// Run `diff-pdf` for two rendered PDFs and report whether their contents differ.
@@ -166,9 +212,33 @@ async fn diff_pdfs(current_pdf: &Path, main_pdf: &Path, diff_pdf: &Path) -> Resu
     }
 }
 
-/// Compare PDFs rendered from the current and `main` model trees and summarize file changes.
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Run a subprocess and fail with captured stderr when it exits unsuccessfully.
+async fn run_command(command: &str, args: &[&str], error_message: &str) -> Result<()> {
+    let output = Command::new(command)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("Failed to run `{command}`"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("command exited with status {}", output.status)
+    };
+
+    anyhow::bail!("{error_message}: {details}");
+}
+
+/// Initialize tracing for this binary and limit output to this crate's logs.
+fn init_tracing() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::filter_fn(
@@ -176,8 +246,10 @@ async fn main() -> Result<()> {
             )),
         )
         .init();
+}
 
-    // Verify `diff-pdf` is installed and available in the PATH
+/// Ensure the `diff-pdf` executable is available before starting any work.
+fn ensure_diff_pdf_is_installed() -> Result<()> {
     if !binary_in_path(DIFF_PDF_BINARY) {
         // `sudo apt-get install -y diff-pdf-wx` or `brew install diff-pdf`
         anyhow::bail!(
@@ -185,73 +257,73 @@ async fn main() -> Result<()> {
         );
     }
 
-    let project_dir = env::current_dir().context("Failed to get current directory")?;
-    let tmp_dir = project_dir.join(TMP_DIR_NAME);
-    tracing::info!("Current directory: {}", tmp_dir.display());
+    Ok(())
+}
 
-    let models_dir = project_dir.join(MODELS_DIR_NAME);
-    let current_root = tmp_dir.join(CURRENT_MODELS_DIR_NAME);
-    let main_root = tmp_dir.join(MAIN_MODELS_DIR_NAME);
-    let diffs_root = tmp_dir.join(DIFFS_DIR_NAME);
-    let current_pdfs_root = tmp_dir.join(CURRENT_PDFS_DIR_NAME);
-    let main_pdfs_root = tmp_dir.join(MAIN_PDFS_DIR_NAME);
-
-    // Clean the tmp directory if it exists
+/// Remove the temporary working directory when it exists from a previous run.
+async fn clean_tmp_dir(tmp_dir: &Path) -> Result<()> {
     if tmp_dir.exists() {
-        Command::new("rm")
-            .args(["-rf", tmp_dir.to_string_lossy().as_ref()])
-            .output()
-            .await
-            .context("Failed to clean tmp directory")?;
+        run_command(
+            "rm",
+            &["-rf", tmp_dir.to_string_lossy().as_ref()],
+            "Failed to clean tmp directory",
+        )
+        .await?;
     }
 
-    // Create a tmp directory to hold the checked out models from the main branch
-    Command::new("mkdir")
-        .args(["-p", &main_root.to_string_lossy().as_ref()])
-        .output()
+    Ok(())
+}
+
+/// Prepare the temporary workspace by separating current and `main` model trees.
+async fn prepare_workspace(paths: &WorkspacePaths) -> Result<()> {
+    clean_tmp_dir(&paths.tmp_dir).await?;
+
+    tokio::fs::create_dir_all(&paths.tmp_dir)
         .await
         .context("Failed to create tmp directory")?;
 
-    // Move `models/` to `tmp/current-models/`
-    tokio::fs::rename(&models_dir, &current_root)
+    tokio::fs::create_dir_all(&paths.main_root)
+        .await
+        .context("Failed to create tmp directory")?;
+
+    tokio::fs::rename(&paths.models_dir, &paths.current_root)
         .await
         .context("Failed to move models/ to tmp/current-models/")?;
 
-    // Checkout `models/` from the main branch into `tmp/main-models/`
-    Command::new("git")
-        .args(["checkout", GIT_MAIN_BRANCH, MODELS_DIR_NAME])
-        .output()
-        .await
-        .context("Failed to checkout models/ from main branch")?;
+    run_command(
+        "git",
+        &["checkout", GIT_MAIN_REF, "--", MODELS_DIR_NAME],
+        "Failed to checkout models/ from main branch",
+    )
+    .await?;
 
-    // Move `models/` to `tmp/main-models/`
-    tokio::fs::rename(&models_dir, &main_root)
+    tokio::fs::rename(&paths.models_dir, &paths.main_root)
         .await
         .context("Failed to move models/ to tmp/main-models/")?;
 
-    // Restore the current `models/` from ``tmp/current-models/` to avoid any issues with the current working directory
-    Command::new("cp")
-        .arg("-r")
-        .args([
-            current_root.to_string_lossy().as_ref(),
-            project_dir.to_string_lossy().as_ref(),
-        ])
-        .output()
-        .await
-        .context("Failed to restore models/ from tmp/current-models/")?;
+    run_command(
+        "cp",
+        &["-r", paths.current_root.to_string_lossy().as_ref(), "."],
+        "Failed to restore models/ from tmp/current-models/",
+    )
+    .await?;
 
-    // Rename `current-models/` to `models/` to restore the current working directory
-    tokio::fs::rename(&project_dir.join(CURRENT_MODELS_DIR_NAME), &models_dir)
+    tokio::fs::rename(Path::new(CURRENT_MODELS_DIR_NAME), &paths.models_dir)
         .await
         .context("Failed to rename tmp/current-models/ to models/")?;
 
-    let current_files = collect_typst_files(&current_root)?;
+    Ok(())
+}
+
+/// Partition model files into added, deleted, and shared groups.
+fn group_model_files(current_root: &Path, main_root: &Path) -> Result<FileGroups> {
+    let current_files = collect_typst_files(current_root)?;
     tracing::info!(
         "Found {} typst files in current branch",
         current_files.len()
     );
 
-    let main_files = collect_typst_files(&main_root)?;
+    let main_files = collect_typst_files(main_root)?;
     tracing::info!("Found {} typst files in main branch", main_files.len());
 
     let current_set: HashSet<PathBuf> = current_files.into_iter().collect();
@@ -279,126 +351,226 @@ async fn main() -> Result<()> {
     deleted_files.sort_unstable();
     common_files.sort_unstable();
 
-    // Log the new and deleted and common files
-    if !new_files.is_empty() {
-        info!("New files:");
-        for file in &new_files {
-            info!("  🟢 {}", file.display());
-        }
+    Ok(FileGroups {
+        new_files,
+        deleted_files,
+        common_files,
+    })
+}
+
+/// Log one named group of files using the provided status icon.
+fn log_file_group(label: &str, icon: &str, files: &[PathBuf]) {
+    if files.is_empty() {
+        return;
     }
 
-    if !deleted_files.is_empty() {
-        info!("Deleted files:");
-        for file in &deleted_files {
-            info!("  🔴 {}", file.display());
-        }
+    info!("{label}:");
+    for file in files {
+        info!("  {icon} {}", file.display());
     }
+}
 
-    if !common_files.is_empty() {
-        info!("Common files:");
-        for file in &common_files {
-            info!("  🔵 {}", file.display());
-        }
-    }
+/// Log all grouped model file changes.
+fn log_file_groups(groups: &FileGroups) {
+    log_file_group("New files", "🟢", &groups.new_files);
+    log_file_group("Deleted files", "🔴", &groups.deleted_files);
+    log_file_group("Common files", "🔵", &groups.common_files);
+}
 
-    tokio::fs::create_dir_all(&diffs_root)
+/// Load Typst contexts for the current branch and the checked-out `main` branch.
+async fn load_pdf_contexts(paths: &WorkspacePaths) -> Result<(Arc<PdfContext>, Arc<PdfContext>)> {
+    tokio::fs::create_dir_all(&paths.diffs_root)
         .await
         .context("Failed to create tmp/diffs")?;
 
     let current_context = Arc::new(
-        PdfContext::from_directory(&current_root)
-            .with_context(|| format!("Failed to load {}", current_root.display()))?,
+        PdfContext::from_directory(&paths.current_root)
+            .with_context(|| format!("Failed to load {}", paths.current_root.display()))?,
     );
     let main_context = Arc::new(
-        PdfContext::from_directory(&main_root)
-            .with_context(|| format!("Failed to load {}", main_root.display()))?,
+        PdfContext::from_directory(&paths.main_root)
+            .with_context(|| format!("Failed to load {}", paths.main_root.display()))?,
     );
     info!("Typst contexts loaded");
 
+    Ok((current_context, main_context))
+}
+
+/// Render PDFs for newly added templates and return their summary rows.
+async fn summarize_new_files(
+    paths: &WorkspacePaths,
+    current_context: &Arc<PdfContext>,
+    new_files: Vec<PathBuf>,
+) -> Result<Vec<DiffSummaryRow>> {
     let mut results = Vec::new();
 
     for rel in new_files {
         let template = template_name(&rel)?;
-        let pdf_rel = rel.with_extension(PDF_FILE_EXTENSION);
-        let added_pdf = diffs_root.join(&pdf_rel);
+        let pdf_rel = rel.with_extension("pdf");
+        let added_pdf = paths.diffs_root.join(&pdf_rel);
 
-        let input = load_render_input(&current_root, &template).await?;
-        render_pdf(
-            Arc::clone(&current_context),
-            template,
-            input,
-            &rel,
-            &added_pdf,
-        )
-        .await?;
+        let inputs = load_render_inputs(&paths.current_root, &template).await?;
 
-        results.push((
-            rel,
-            STATUS_ADDED,
-            Some(Path::new(DIFFS_DIR_NAME).join(pdf_rel)),
-        ));
+        for (input_name, input) in inputs {
+            render_pdf(
+                Arc::clone(current_context),
+                template.clone(),
+                input,
+                &rel,
+                &added_pdf,
+            )
+            .await?;
+
+            results.push((
+                rel.clone(),
+                Some(input_name),
+                "added",
+                Some(Path::new(DIFFS_DIR_NAME).join(pdf_rel.clone())),
+            ));
+        }
     }
 
-    for rel in deleted_files {
-        results.push((rel, STATUS_DELETED, None));
-    }
+    Ok(results)
+}
+
+/// Convert deleted templates into summary rows without generating PDF artifacts.
+fn summarize_deleted_files(deleted_files: Vec<PathBuf>) -> Vec<DiffSummaryRow> {
+    deleted_files
+        .into_iter()
+        .map(|rel| (rel, None, "deleted", None))
+        .collect()
+}
+
+/// Render and compare PDFs for templates that exist in both branches.
+async fn summarize_common_files(
+    paths: &WorkspacePaths,
+    current_context: &Arc<PdfContext>,
+    main_context: &Arc<PdfContext>,
+    common_files: Vec<PathBuf>,
+) -> Result<Vec<DiffSummaryRow>> {
+    let mut results = Vec::new();
 
     for rel in common_files {
         let template = template_name(&rel)?;
-        let pdf_rel = rel.with_extension(PDF_FILE_EXTENSION);
-        let current_pdf = current_pdfs_root.join(&pdf_rel);
-        let main_pdf = main_pdfs_root.join(&pdf_rel);
-        let diff_pdf = diffs_root.join(&pdf_rel);
+        let pdf_rel = rel.with_extension("pdf");
+        let current_pdf = paths.current_pdfs_root.join(&pdf_rel);
+        let main_pdf = paths.main_pdfs_root.join(&pdf_rel);
+        let diff_pdf = paths.diffs_root.join(&pdf_rel);
 
-        let input = load_render_input(&current_root, &template).await?;
-        render_pdf(
-            Arc::clone(&current_context),
-            template.clone(),
-            input,
-            &rel,
-            &current_pdf,
-        )
-        .await?;
+        let inputs = load_render_inputs(&paths.current_root, &template).await?;
 
-        let input = load_render_input(&main_root, &template).await?;
-        render_pdf(Arc::clone(&main_context), template, input, &rel, &main_pdf).await?;
+        for (input_name, input) in inputs {
+            render_pdf(
+                Arc::clone(current_context),
+                template.clone(),
+                input,
+                &rel,
+                &current_pdf,
+            )
+            .await?;
 
-        let changed = diff_pdfs(&current_pdf, &main_pdf, &diff_pdf).await?;
-        if !changed {
-            let _ = tokio::fs::remove_file(&diff_pdf).await;
+            let inputs = load_render_inputs(&paths.main_root, &template).await?;
+            let input_tuple = inputs.into_iter().find(|(name, _)| name == &input_name);
+
+            if let Some((_, input)) = input_tuple {
+                render_pdf(
+                    Arc::clone(main_context),
+                    template.clone(),
+                    input,
+                    &rel,
+                    &main_pdf,
+                )
+                .await?;
+
+                let changed = diff_pdfs(&current_pdf, &main_pdf, &diff_pdf).await?;
+                if !changed {
+                    let _ = tokio::fs::remove_file(&diff_pdf).await;
+                }
+                let status = if changed { "changed" } else { "identical" };
+                let diff_link = changed.then(|| Path::new(DIFFS_DIR_NAME).join(&pdf_rel));
+                results.push((rel.clone(), Some(input_name), status, diff_link));
+            }
         }
-        let status = if changed {
-            STATUS_CHANGED
-        } else {
-            STATUS_IDENTICAL
-        };
-        let diff_link = changed.then(|| Path::new(DIFFS_DIR_NAME).join(&pdf_rel));
-        results.push((rel, status, diff_link));
     }
 
-    results.sort_unstable_by(|(left, _, _), (right, _, _)| left.cmp(right));
+    Ok(results)
+}
+
+fn status_indicator(status: &str) -> &'static str {
+    match status {
+        "added" => "🟢",
+        "deleted" => "🔴",
+        "changed" => "🟠",
+        "identical" => "🔵",
+        _ => "⚪",
+    }
+}
+
+/// Build the Markdown summary table written to `tmp/results.md`.
+fn build_report(mut results: Vec<DiffSummaryRow>) -> Result<String> {
+    results.sort_unstable_by(
+        |(left_template, left_input, ..), (right_template, right_input, ..)| {
+            left_template
+                .cmp(right_template)
+                .then_with(|| left_input.cmp(right_input))
+        },
+    );
 
     let mut report = String::new();
-    writeln!(
-        report,
-        "| {TABLE_TEMPLATE_HEADER} | {TABLE_STATUS_HEADER} | {TABLE_DIFF_HEADER} |"
-    )?;
+    writeln!(report, "| Template | Input | Status |")?;
     writeln!(report, "| --- | --- | --- |")?;
-    for (template, status, diff_link) in results {
-        let diff_cell = diff_link
-            .map(|path| format!("[pdf]({})", path.display()))
-            .unwrap_or_default();
+    for (template, input_name, status, _) in results {
         writeln!(
             report,
-            "| {} | {status} | {diff_cell} |",
-            template.display()
+            "| {} | {} | {} {status} |",
+            template.display(),
+            input_name.unwrap_or_default(),
+            status_indicator(status),
         )?;
     }
-    let results_path = tmp_dir.join(RESULTS_FILE_NAME);
-    tokio::fs::write(&results_path, report)
+
+    Ok(report)
+}
+
+/// Persist the generated Markdown report to disk.
+async fn write_report(results_path: &Path, report: &str) -> Result<()> {
+    tokio::fs::write(results_path, report)
         .await
-        .with_context(|| format!("Failed to write {}", results_path.display()))?;
-    info!("Wrote results to {}", results_path.display());
+        .with_context(|| format!("Failed to write {}", results_path.display()))
+}
+
+/// Execute the full PDF diff workflow from setup through summary generation.
+async fn run() -> Result<()> {
+    ensure_diff_pdf_is_installed()?;
+
+    let project_dir = env::current_dir().context("Failed to get current directory")?;
+    let paths = WorkspacePaths::new(project_dir);
+    tracing::info!("Current directory: {}", paths.tmp_dir.display());
+
+    prepare_workspace(&paths).await?;
+
+    let groups = group_model_files(&paths.current_root, &paths.main_root)?;
+    log_file_groups(&groups);
+
+    let (current_context, main_context) = load_pdf_contexts(&paths).await?;
+
+    let mut results = summarize_new_files(&paths, &current_context, groups.new_files).await?;
+    results.extend(summarize_deleted_files(groups.deleted_files));
+    results.extend(
+        summarize_common_files(&paths, &current_context, &main_context, groups.common_files)
+            .await?,
+    );
+
+    let report = build_report(results)?;
+    write_report(&paths.results_path, &report).await?;
+    info!("Wrote results to {}", paths.results_path.display());
 
     Ok(())
+}
+
+/// Compare PDFs rendered from the current and `main` model trees and summarize file changes.
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    run().await
 }
