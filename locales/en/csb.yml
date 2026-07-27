@@ -73,6 +73,7 @@ import:
     not_found: No data was found for the entered hash code.
 index:
   closes_on: Closes on
+  download_election_definition: Download election definition
   feature:
     add_omissions: Add omissions and corrections
     create_i1_letters: Create I 1 and omission letters

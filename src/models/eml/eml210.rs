@@ -1,6 +1,5 @@
-//! The EML 2.10 candidate nomination export, built with [`eml_nl`].
+//! The EML 210 candidate nomination export, built with [`eml_nl`].
 
-use chrono::Datelike;
 use eml_nl::{
     common::{
         AuthorityIdentifier, CandidateIdentifier, CountryNameCode, CreatedByAuthority, FirstName,
@@ -8,15 +7,15 @@ use eml_nl::{
         PersonName,
     },
     documents::{
-        EML,
+        EML, ElectionIdentifierBuilder,
         candidate_lists::QualifyingAddress,
         nomination::{
             AgentIdentifier, Nomination, NominationAffiliation, NominationContestIdentifier,
-            NominationElectionIdentifier, NominationNominate,
+            NominationNominate,
         },
     },
     io::EMLWrite,
-    utils::{AffiliationType, AuthorityId, CandidateId, ContestId, ElectionId, StringValue},
+    utils::{AffiliationType, AuthorityId, CandidateId, ContestId, StringValue},
 };
 
 use crate::{
@@ -24,93 +23,11 @@ use crate::{
     candidate_lists::{CandidateListId, FullCandidateList},
     candidates::Candidate,
     common::{Address, BsnOrNoneConfirmed, DutchAddress, FullName, Gender},
-    core::{ElectionType, ModelLocale},
+    core::ModelLocale,
     list_submitters::ListSubmitter,
     persons::Representative,
     political_groups::PoliticalGroup,
-    utils::slugify_teletex,
 };
-
-impl From<ElectionType> for eml_nl::utils::ElectionCategory {
-    fn from(value: ElectionType) -> Self {
-        match value {
-            ElectionType::Tk => eml_nl::utils::ElectionCategory::TK,
-            ElectionType::Ek => eml_nl::utils::ElectionCategory::EK,
-            ElectionType::Gr => eml_nl::utils::ElectionCategory::GR,
-            ElectionType::Ps => eml_nl::utils::ElectionCategory::PS,
-            ElectionType::Ws => eml_nl::utils::ElectionCategory::AB,
-            ElectionType::Ep => eml_nl::utils::ElectionCategory::EP,
-            ElectionType::Kc | ElectionType::Kcni => {
-                todo!("Kiescolleges don't have an official code yet in EML-NL")
-            }
-            ElectionType::Er => eml_nl::utils::ElectionCategory::ER,
-        }
-    }
-}
-
-impl From<&ElectionConfig> for eml_nl::utils::ElectionSubcategory {
-    fn from(value: &ElectionConfig) -> Self {
-        match value.election_type() {
-            ElectionType::Tk => eml_nl::utils::ElectionSubcategory::TK,
-            ElectionType::Ek => eml_nl::utils::ElectionSubcategory::EK,
-            ElectionType::Gr => {
-                if value.nineteen_or_more_seats() {
-                    eml_nl::utils::ElectionSubcategory::GR2
-                } else {
-                    eml_nl::utils::ElectionSubcategory::GR1
-                }
-            }
-            ElectionType::Ps => {
-                if value.has_only_one_district() {
-                    eml_nl::utils::ElectionSubcategory::PS1
-                } else {
-                    eml_nl::utils::ElectionSubcategory::PS2
-                }
-            }
-            ElectionType::Ws => {
-                if value.nineteen_or_more_seats() {
-                    eml_nl::utils::ElectionSubcategory::AB2
-                } else {
-                    eml_nl::utils::ElectionSubcategory::AB1
-                }
-            }
-            ElectionType::Ep => eml_nl::utils::ElectionSubcategory::EP,
-            ElectionType::Kc | ElectionType::Kcni => {
-                todo!("Kiescolleges don't have an official code yet in EML-NL")
-            }
-            ElectionType::Er => eml_nl::utils::ElectionSubcategory::ER1,
-        }
-    }
-}
-
-impl TryFrom<ElectionConfig> for eml_nl::documents::nomination::NominationElectionIdentifier {
-    type Error = AppError;
-
-    fn try_from(value: ElectionConfig) -> Result<Self, Self::Error> {
-        let category = eml_nl::utils::ElectionCategory::from(value.election_type());
-        let year = value.election_date().year();
-
-        let id = if let Some(region) = value.region_title(crate::AnyLocale::Nl) {
-            format!(
-                "{}{}_{}",
-                category.to_eml_value(),
-                year,
-                slugify_teletex(region, false)
-            )
-        } else {
-            format!("{}{}", category.to_eml_value(), year)
-        };
-
-        Ok(NominationElectionIdentifier::builder()
-            .name(value.full_formal_title(crate::core::ModelLocale::Nl))
-            .category(category)
-            .subcategory(&value)
-            .election_date(value.election_date())
-            .nomination_date(value.nomination_day_date())
-            .id(ElectionId::new(id)?)
-            .build_for_nomination()?)
-    }
-}
 
 impl From<&FullName> for eml_nl::common::PersonNameStructure {
     fn from(val: &FullName) -> Self {
@@ -250,7 +167,7 @@ fn nomination_proposer(
     })
 }
 
-/// Build the EML 2.10 candidate nomination XML for a candidate list.
+/// Build the EML 210 candidate nomination XML for a candidate list.
 pub fn eml210(
     store: &PgStore,
     election: &ElectionConfig,
@@ -310,7 +227,9 @@ pub fn eml210(
         )
         .issue_date(now.date_naive())
         .creation_date_time(now)
-        .election_identifier(NominationElectionIdentifier::try_from(*election)?)
+        .election_identifier(
+            ElectionIdentifierBuilder::try_from(*election)?.build_for_nomination()?,
+        )
         .contest_identifier(if election.has_only_one_district() {
             NominationContestIdentifier::new(ContestId::geen(), "")
         } else if list.contains_all_districts(election) {
@@ -430,7 +349,7 @@ mod tests {
         // verify
         check_eml(
             &String::from_utf8(eml).unwrap(),
-            include_str!("testdata/ek27.eml.xml"),
+            include_str!("testdata/210-ek27.eml.xml"),
         )
         .await;
     }
@@ -458,7 +377,7 @@ mod tests {
         // verify
         check_eml(
             &String::from_utf8(eml).unwrap(),
-            include_str!("testdata/ps27-1.eml.xml"),
+            include_str!("testdata/210-ps27-1.eml.xml"),
         )
         .await;
     }
@@ -487,7 +406,7 @@ mod tests {
         // verify
         check_eml(
             &String::from_utf8(eml).unwrap(),
-            include_str!("testdata/ps27-2.eml.xml"),
+            include_str!("testdata/210-ps27-2.eml.xml"),
         )
         .await;
     }
@@ -515,7 +434,7 @@ mod tests {
         // verify
         check_eml(
             &String::from_utf8(eml).unwrap(),
-            include_str!("testdata/ws27.eml.xml"),
+            include_str!("testdata/210-ws27.eml.xml"),
         )
         .await;
     }

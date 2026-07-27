@@ -73,6 +73,7 @@ import:
     not_found: Er is geen data gevonden voor de ingevoerde hash code.
 index:
   closes_on: Sluit op
+  download_election_definition: Verkiezings\u00ADdefinitie downloaden
   feature:
     add_omissions: Verzuimen en correcties toevoegen
     create_i1_letters: I 1 en verzuimbrieven aanmaken
