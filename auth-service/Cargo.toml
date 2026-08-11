@@ -6,15 +6,29 @@ license.workspace = true
 publish.workspace = true
 
 [features]
+default = ["backend-bergshamra"]
+
+# XML-DSig signing/verification backend (mutually exclusive; exactly one).
+# `backend-bergshamra` is the pure-Rust default, shipped in the binary with no
+# system dependency. `backend-xmlsec` swaps sign/verify to libxmlsec1 (the
+# reference C implementation) via the minimal `xmlsec-mini-sys` FFI; build it
+# with `--no-default-features --features backend-xmlsec`. XML-Enc decryption
+# always uses `bergshamra-enc` regardless of this choice.
+backend-bergshamra = ["dep:bergshamra-dsig"]
+backend-xmlsec = ["dep:xmlsec-mini-sys"]
+
 # Talk to the online TVS mock service: default `TVS_ENV` to `test` and `BASE_URL`
 # to `http://localhost:3000`, and embed the committed DV cert/key bundle
 # (`auth-service/fixtures`)
 tvs-mock = []
 
 [dependencies]
-bergshamra-dsig = "0.7"
-bergshamra-enc  = "0.7"
-bergshamra-keys = "0.7"
+# XML-Enc (decryption) + key loading: always required, both backends use these.
+bergshamra-enc  = "0.8"
+bergshamra-keys = "0.8"
+# XML-DSig backends (feature-gated, optional): exactly one is compiled in.
+bergshamra-dsig = { version = "0.8", optional = true }
+xmlsec-mini-sys = { path = "../xmlsec-mini-sys", optional = true }
 cookie = "0.18"
 base64 = "0.22"
 sha1 = "0.11"
