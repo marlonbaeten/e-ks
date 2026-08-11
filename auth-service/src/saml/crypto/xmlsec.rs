@@ -19,11 +19,25 @@
 use super::SignatureVerification;
 use crate::error::{AuthError, Result};
 use crate::saml::xml_parser::{all_elements, parse};
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::OnceLock;
 
 use xmlsec_mini_sys as sys;
+
+/// No-op xmlsec error sink. A failed verify is a normal `Invalid` outcome here,
+/// not something to spam on stderr (bergshamra is silent); route libxmlsec1's
+/// diagnostics into the void.
+unsafe extern "C" fn silence_errors(
+    _file: *const c_char,
+    _line: c_int,
+    _func: *const c_char,
+    _error_object: *const c_char,
+    _error_subject: *const c_char,
+    _reason: c_int,
+    _msg: *const c_char,
+) {
+}
 
 /// Attribute names that carry an `#id` reference target. Must stay aligned with
 /// `saml::verification::ID_ATTRIBUTES` and the pure-Rust backend's ID map so all
@@ -56,6 +70,7 @@ fn ensure_init() -> Result<()> {
             if sys::xmlSecOpenSSLInit() < 0 {
                 return Err("xmlSecOpenSSLInit failed".to_string());
             }
+            sys::xmlSecErrorsSetCallback(Some(silence_errors));
         }
         Ok(())
     })
