@@ -1,0 +1,14 @@
+[package]
+name = "xmlsec-mini-sys"
+version = "0.1.0"
+edition = "2024"
+license = "EUPL-1.2"
+publish = false
+description = "Minimal FFI bindings to libxmlsec1 + libxml2 for XML-DSig sign/verify"
+# Declares that this crate links the native xmlsec1 library, so cargo forbids
+# two crates in the graph from linking it twice.
+links = "xmlsec1"
+
+[build-dependencies]
+pkg-config = "0.3"
+bindgen = "0.72"

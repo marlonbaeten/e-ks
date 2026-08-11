@@ -45,3 +45,7 @@ lcov.info
 
 /tmp
 bin/pdf_diff
+
+# Excluded sub-crate builds standalone; the workspace root Cargo.lock is authoritative.
+/xmlsec-mini-sys/Cargo.lock
+/xmlsec-mini-sys/target/

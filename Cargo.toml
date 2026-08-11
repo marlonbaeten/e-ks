@@ -1,5 +1,10 @@
 [workspace]
 members = ["validate", "auth-service", "development", "tooling"]
+# `xmlsec-mini-sys` links a native C library (libxmlsec1) and is only pulled in
+# when auth-service is built with `--features backend-xmlsec`. Excluding it keeps
+# workspace-wide `cargo build`/`test` from requiring the C toolchain; it is still
+# built on demand as auth-service's optional path dependency.
+exclude = ["xmlsec-mini-sys"]
 resolver = "3"
 
 # Fields shared by every crate in the workspace. Individual crates inherit these
