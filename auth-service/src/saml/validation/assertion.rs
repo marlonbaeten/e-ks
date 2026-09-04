@@ -259,10 +259,14 @@ impl Validator<'_, '_> {
             .find(|&&a| self.doc.get_attribute(a, "Name") == Some(EID_SERVICE_UUID))
             .and_then(|&a| find_descendant(self.doc, a, NS_SAML, "AttributeValue"))
             // `direct_text`: the ServiceUUID is the AttributeValue's own text.
-            .and_then(|av| direct_text(self.doc, av));
+            // Trimmed at extraction, like the LoA URI in `check_authn_context`, so
+            // the returned claim carries the same normalised value the check below
+            // compares rather than the RD's surrounding indentation.
+            .and_then(|av| direct_text(self.doc, av))
+            .map(|u| u.trim().to_string());
 
         if let Some(expected) = expected {
-            match service_uuid.as_deref().map(str::trim) {
+            match service_uuid.as_deref() {
                 Some(u) if u == expected.as_str() => {}
                 Some(u) => self.error(format!(
                     "ServiceUUID mismatch: expected {expected}, got {u}"
@@ -398,10 +402,18 @@ impl Validator<'_, '_> {
     fn check_audience_restriction(&mut self, root: NodeId, dv_entity_id: &EntityId) {
         // `direct_text`: an entry with element children is not an audience, so it
         // is skipped and cannot match.
+        //
+        // Trimmed for the same reason as the LoA URI in `check_authn_context`: an
+        // <Audience> holds one EntityID token, and the RD's pretty-printing puts
+        // a newline and indentation around it (see
+        // `tests/fixtures/tvs/artifact_response_cluster.xml`, whose first entry
+        // is indented). Whitespace here would fail rule 5 against an assertion
+        // that does name us.
         let audiences: Vec<String> = self
             .find_claims(root, "Audience")
             .iter()
             .filter_map(|&n| direct_text(self.doc, n))
+            .map(|a| a.trim().to_string())
             .collect();
         debug!(
             "[validate] Rule 5: AudienceRestriction has {} audience(s); expected '{}'",
@@ -429,12 +441,23 @@ impl Validator<'_, '_> {
         // `direct_text`: the LoA URI decides whether this authentication is strong
         // enough. Element children yield `None`, rejected below as a missing
         // AuthnContextClassRef.
+        //
+        // Trimmed because both values are a single URI token, and the RD
+        // pretty-prints: the real TVS assertion carries the URI followed by a
+        // newline and the closing tag's indentation (see
+        // `tests/fixtures/tvs/artifact_response_success.xml`). The §10.3 lookup
+        // below is an exact match, so an untrimmed value is read as an
+        // unrecognised LoA and a conformant authentication is rejected. Matches
+        // how `check_issuer` and `check_service_uuid` treat their own URI-valued
+        // element text.
         let authn_context_class_ref = self
             .find_claim(root, "AuthnContextClassRef")
-            .and_then(|n| direct_text(self.doc, n));
+            .and_then(|n| direct_text(self.doc, n))
+            .map(|t| t.trim().to_string());
         let authenticating_authority = self
             .find_claim(root, "AuthenticatingAuthority")
-            .and_then(|n| direct_text(self.doc, n));
+            .and_then(|n| direct_text(self.doc, n))
+            .map(|t| t.trim().to_string());
         debug!(
             "[validate] AuthnContextClassRef={:?}, AuthenticatingAuthority={:?}",
             authn_context_class_ref.as_deref(),

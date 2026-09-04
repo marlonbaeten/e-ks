@@ -263,3 +263,17 @@ attack PoCs ([`xsw_sibling_poc.rs`](tests/xsw_sibling_poc.rs),
 [`xsw_exploit_check.rs`](tests/xsw_exploit_check.rs)) that must stay rejected.
 [`tvs_metadata.rs`](tests/tvs_metadata.rs) validates the real TVS mock metadata;
 its tests are `#[ignore]`d because they need network access.
+
+[`tvs_wire_samples.rs`](tests/tvs_wire_samples.rs) runs the validators over
+`ArtifactResponse` messages the real RD emitted, rather than over XML this
+repository composed: the successful 4.4 flow, the §6.3 cluster variant, the two
+§7.8 error paths, and a pre-4.4 DigiD message that must be rejected. The samples
+and their provenance are in [`tests/fixtures/tvs/`](tests/fixtures/tvs/).
+
+## Comparison with the TVS reference implementation
+
+[nl-rdo-max-comparison.md](nl-rdo-max-comparison.md) is a check-by-check diff of
+this crate's validators against [`minvws/nl-rdo-max`](https://github.com/minvws/nl-rdo-max),
+the TVS reference Service Provider these validators already cite for the
+assertion trust model — where the two agree, where each is stricter, and what
+the comparison changed here.
