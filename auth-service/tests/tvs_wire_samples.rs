@@ -1,31 +1,12 @@
-//! The validators, run against `ArtifactResponse` messages the real TVS
-//! *Routeringsdienst* emitted.
+//! The validators, run against real TVS `ArtifactResponse` messages (see
+//! `fixtures/tvs/README.md`) rather than XML this repository composed, so the
+//! RD's actual namespace prefixes, attribute order and element whitespace are
+//! covered.
 //!
-//! Every other suite in `tests/` feeds the validators XML this repository
-//! composed. That proves the rules are implemented, but not that they are
-//! implemented against the wire format the RD actually produces: real messages
-//! differ in namespace prefixes, attribute order, element indentation, and the
-//! whitespace inside element text. This suite closes that gap with samples
-//! captured from TVS (see `fixtures/tvs/README.md` for provenance and licence).
-//!
-//! # What these samples cannot exercise
-//!
-//! - **Signatures.** Each sample's `KeyInfo` names its key by fingerprint only,
-//!   and eID §9.2 forbids trusting a key that did not come from verified
-//!   metadata — of which we hold none for the environment they were captured
-//!   from. The suite therefore drives the Response (§7.6.2) and Assertion
-//!   (§7.6.3) validators directly; the signature layer keeps its own tests in
-//!   `xsw_*.rs`.
-//! - **The decrypted identity.** The `EncryptedID` payloads are wrapped to a DV
-//!   key we do not hold, so `Claims::acting_subject_id` is always `None` here.
-//!
-//! # Timestamps
-//!
-//! The samples are from 2021-2023 and their `Conditions` windows are two minutes
-//! wide, so [`shift_timestamps`] rewrites every instant into the current window,
-//! preserving the offsets between them. Nothing else about the bytes changes.
-//! [`success_sample_unshifted_fails_only_the_time_checks`] pins that: on the
-//! pristine bytes, the *only* errors are time-dependent ones.
+//! Not exercised: signatures (the samples name their key by fingerprint and eID
+//! §9.2 allows only keys from verified metadata, of which we hold none for their
+//! environment) and the decrypted identity (`EncryptedID` is wrapped to a DV key
+//! we do not hold, so `acting_subject_id` is always `None` here).
 
 use auth_service::{
     bindings::soap::unwrap_soap,
@@ -42,14 +23,11 @@ use auth_service::{
 };
 use chrono::{DateTime, Utc};
 
-// ---------------------------------------------------------------------------
-// Fixture values. Each is the literal value in the captured message, so a test
-// configures the DV the RD actually addressed rather than a stand-in.
-// ---------------------------------------------------------------------------
+// Literal values from the captured messages, so each test configures the DV the
+// RD actually addressed.
 
 const RD: &str = "urn:nl-eid-gdi:1.0:RD:00000004000000149000:entities:9002";
 
-/// `artifact_response_success.xml`: the LoA-substantial happy path.
 mod success {
     pub const FILE: &str = "artifact_response_success.xml";
     pub const ACS: &str = "https://poc-1.uzi.bavod.nl/acs";
@@ -57,14 +35,13 @@ mod success {
     pub const SERVICE_UUID: &str = "464f504d-5857-5946-304f-494449414a4d";
     pub const LOA: &str = "http://eidas.europa.eu/LoA/substantial";
     pub const AD: &str = "urn:nl-eid-gdi:1.0:AD:00000004166909913000:entities:9002";
-    /// The Subject NameID of the *outer* assertion: a bare hex string carrying
-    /// no `@Format` at all.
+    /// Outer Subject NameID: a bare hex string with no `@Format`.
     pub const NAME_ID: &str = "64b0d194095940008ffa142b12444c01";
     pub const IN_RESPONSE_TO: &str =
         "_837f3790c95cd6ca4cb815edd30f583d0fe6313a2ab0b53ccc65f972b571fabcf70924f49e4d8deb0e";
 
-    /// Values that exist only inside the `<saml:Advice>` AD assertion. Claim
-    /// extraction must never surface one of these.
+    /// Values only inside the `<saml:Advice>` AD assertion; claims must never
+    /// surface one.
     pub mod advice {
         pub const NAME_ID: &str = "2cbd6231-4257-44ae-aa87-b4bfc25e232f";
         pub const IN_RESPONSE_TO: &str = "_a7efd80d17a4f064dde50b9cd78aca7b";
@@ -72,7 +49,6 @@ mod success {
     }
 }
 
-/// `artifact_response_cluster.xml`: the §6.3 cluster-connection variant.
 mod cluster {
     pub const FILE: &str = "artifact_response_cluster.xml";
     pub const ACS: &str = "https://endpoint.example/acs";
@@ -82,10 +58,6 @@ mod cluster {
     pub const NAME_ID: &str = "3efa072a56034ebe939516e30a979a00";
 }
 
-// ---------------------------------------------------------------------------
-// Loading
-// ---------------------------------------------------------------------------
-
 fn load(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/tvs")
@@ -93,13 +65,10 @@ fn load(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Every timestamp in `xml`, moved into the current validity window.
-///
-/// The first instant encountered becomes "now" and every other one keeps its
-/// offset from it, so the two-minute `Conditions` and `SubjectConfirmationData`
-/// windows the RD issued still bracket the present. Only attribute values that
-/// parse as a timestamp are touched; the rest of the document, including the
-/// signatures (which we do not verify), is byte-identical.
+/// Move every timestamp in `xml` into the current validity window: the first
+/// instant becomes "now" and the rest keep their offset from it, so the RD's
+/// two-minute windows still bracket the present. Only attribute values that
+/// parse as a timestamp are touched.
 fn shift_timestamps(xml: &str) -> String {
     let now = Utc::now();
     let mut anchor: Option<DateTime<Utc>> = None;
@@ -113,8 +82,7 @@ fn shift_timestamps(xml: &str) -> String {
             Ok(instant) => {
                 let base = *anchor.get_or_insert(instant);
                 let shifted = now + (instant - base);
-                // Keep the sub-second precision the RD used: the outer messages
-                // are whole seconds, the AD assertion in <Advice> is not.
+                // The outer messages are whole seconds, the AD assertion is not.
                 let format = if part.contains('.') {
                     "%Y-%m-%dT%H:%M:%S%.3fZ"
                 } else {
@@ -128,24 +96,17 @@ fn shift_timestamps(xml: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Running the validators
-// ---------------------------------------------------------------------------
-
-/// The `samlp:ArtifactResponse` inside the sample's SOAP envelope.
 fn artifact_response(doc: &Document) -> NodeId {
     unwrap_soap(doc, doc.document_element()).expect("sample has a SOAP Body with one child")
 }
 
-/// The `samlp:Response` inside an ArtifactResponse, reached without going
-/// through [`validate_artifact_response_at`] (which would first fail on the
-/// signature we cannot verify).
+/// The inner Response, reached without [`validate_artifact_response_at`], which
+/// would first fail on the signature we cannot verify.
 fn inner_response(doc: &Document, art: NodeId) -> NodeId {
     find_child(doc, art, NS_SAMLP, "Response").expect("sample carries an inner Response")
 }
 
-/// Run the Response (§7.6.2) and Assertion (§7.6.3) validators over a sample,
-/// configured for the DV that message was actually addressed to.
+/// Run the Response (§7.6.2) and Assertion (§7.6.3) validators over a sample.
 fn validate_sample(
     doc: &Document,
     acs: &str,
@@ -180,7 +141,6 @@ fn validate_sample(
                 dv_entity_id: &dv,
                 expected_recipient: Some(&acs),
                 expected_issuer: Some(&rd),
-                // The EncryptedID is wrapped to a DV key we do not hold.
                 private_keys: &[],
                 minimum_loa: Some(MINIMUM_LOA),
                 expected_service_uuid: Some(&service_uuid),
@@ -192,8 +152,7 @@ fn validate_sample(
     (claims, errors)
 }
 
-/// [`validate_sample`] on a sample whose timestamps have been moved into the
-/// current window, asserting the validators recorded nothing at all.
+/// [`validate_sample`] on a time-shifted sample, asserting nothing was recorded.
 fn validate_shifted(name: &str, acs: &str, dv: &str, service_uuid: &str) -> Claims {
     let xml = shift_timestamps(&load(name));
     let doc = parse(&xml).expect("real TVS ArtifactResponse parses");
@@ -204,10 +163,6 @@ fn validate_shifted(name: &str, acs: &str, dv: &str, service_uuid: &str) -> Clai
     );
     claims.expect("a run with no errors yields claims")
 }
-
-// ---------------------------------------------------------------------------
-// The successful 4.4 authentication
-// ---------------------------------------------------------------------------
 
 #[test]
 fn success_sample_validates_and_yields_the_expected_claims() {
@@ -224,18 +179,17 @@ fn success_sample_validates_and_yields_the_expected_claims() {
         claims.in_response_to.as_ref().map(MessageId::as_str),
         Some(success::IN_RESPONSE_TO)
     );
-    // No DV decryption key, so the encrypted identity cannot be recovered here.
+    // No DV decryption key here.
     assert!(claims.acting_subject_id.is_none());
     assert!(claims.legal_subject_id.is_none());
 }
 
 #[test]
 fn success_sample_claims_come_from_the_outer_assertion_not_from_advice() {
-    // The `<saml:Advice>` subtree holds a complete, separately signed AD
-    // assertion with its own Subject, Recipient, InResponseTo, ServiceUUID and
-    // ActingSubjectID. eID §9.1 makes it evidence only, so every claim must be
-    // read from the outer assertion. The values differ between the two, which is
-    // what makes the pruning observable rather than merely asserted.
+    // `<saml:Advice>` holds a separately signed AD assertion with its own
+    // Subject, Recipient, InResponseTo and ActingSubjectID. eID §9.1 makes it
+    // evidence only. The values differ, which is what makes the pruning
+    // observable rather than merely asserted.
     let xml = load(success::FILE);
     for value in [
         success::advice::NAME_ID,
@@ -260,16 +214,13 @@ fn success_sample_claims_come_from_the_outer_assertion_not_from_advice() {
         claims.in_response_to.as_ref().map(MessageId::as_str),
         Some(success::advice::IN_RESPONSE_TO)
     );
-    // The Recipient check passed against the outer ACS, not the AD's own — a
-    // mismatch would already have failed `validate_shifted`.
+    // A Recipient read from the Advice would already have failed the ACS check.
 }
 
 #[test]
 fn success_sample_matches_the_loa_despite_whitespace_around_the_uri() {
-    // The RD pretty-prints, so `AuthnContextClassRef` text is the URI followed
-    // by a newline and the closing tag's indentation. The §10.3 lookup is an
-    // exact match, so without normalising that away a conformant authentication
-    // is rejected as an unrecognised LoA. Same for `AuthenticatingAuthority`.
+    // The RD pretty-prints, so the element text is the URI plus a newline and
+    // the closing tag's indentation. The §10.3 lookup is an exact match.
     let raw = load(success::FILE);
     assert!(
         raw.contains(&format!("{}\n", success::LOA)),
@@ -295,9 +246,9 @@ fn success_sample_matches_the_loa_despite_whitespace_around_the_uri() {
 
 #[test]
 fn success_sample_unshifted_fails_only_the_time_checks() {
-    // Guards [`shift_timestamps`]: on the pristine 2022 bytes every
-    // time-bounded check must fail and nothing else may, so the shift cannot be
-    // hiding a structural failure in the tests above.
+    // Guards `shift_timestamps`: on the pristine 2022 bytes only the
+    // time-bounded checks may fail, so the shift cannot be hiding a structural
+    // failure in the tests above.
     const TIME_ERROR_MARKERS: &[&str] = &[
         "is stale",
         "is in the future",
@@ -324,16 +275,11 @@ fn success_sample_unshifted_fails_only_the_time_checks() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The cluster-connection variant (§6.3)
-// ---------------------------------------------------------------------------
-
 #[test]
 fn cluster_sample_validates_with_two_audiences() {
-    // A cluster message names both the LC and the DV in one
-    // `AudienceRestriction`; §7.6.3.5 rule 5 only requires ours to be among
-    // them. The LC entry comes first and is the one carrying leading whitespace
-    // from the pretty-printing.
+    // A cluster message names the LC and the DV in one `AudienceRestriction`;
+    // §7.6.3.5 rule 5 only requires ours to be among them. The LC entry comes
+    // first and carries the pretty-printing's leading whitespace.
     let claims = validate_shifted(
         cluster::FILE,
         cluster::ACS,
@@ -348,16 +294,11 @@ fn cluster_sample_validates_with_two_audiences() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The §7.8 error paths
-// ---------------------------------------------------------------------------
-
 #[test]
 fn login_cancelled_sample_is_rejected_by_the_response_status_check() {
     // The artifact layer reports Success; the failure is the inner Response's
-    // nested `Responder` / `AuthnFailed`. `handle_acs` maps exactly this to
-    // `AuthFailure::Cancelled`, so the status check has to see both levels and
-    // the StatusMessage.
+    // nested `Responder` / `AuthnFailed`, which `handle_acs` maps to
+    // `AuthFailure::Cancelled`.
     let xml = load("artifact_response_login_cancelled.xml");
     let doc = parse(&xml).expect("real TVS login-cancelled message parses");
     let art = artifact_response(&doc);
@@ -393,8 +334,8 @@ fn login_cancelled_sample_is_rejected_by_the_response_status_check() {
 
 #[test]
 fn request_denied_sample_is_rejected_at_the_artifact_layer() {
-    // `Requester` / `RequestDenied` is reported on the ArtifactResponse itself,
-    // and the message carries no inner Response at all (§7.6.1).
+    // §7.6.1: the status is on the ArtifactResponse and there is no inner
+    // Response at all.
     let xml = load("artifact_response_request_denied.xml");
     let doc = parse(&xml).expect("real TVS request-denied message parses");
     let art = artifact_response(&doc);
@@ -409,9 +350,8 @@ fn request_denied_sample_is_rejected_at_the_artifact_layer() {
         &doc,
         art,
         &ValidateArtifactResponseOpts {
-            // eID §9.2 keys come from verified metadata and we hold none for this
-            // environment, so the signature check fails too. This test is about
-            // the status check running and reporting both levels.
+            // No metadata for this environment, so the signature check fails
+            // too; this test is about the status check reporting both levels.
             trusted_keys: &[],
             expected_in_response_to: None,
             expected_issuer: None,
@@ -430,19 +370,11 @@ fn request_denied_sample_is_rejected_at_the_artifact_layer() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The pre-4.4 shape
-// ---------------------------------------------------------------------------
-
 #[test]
 fn pre_44_digid_sample_is_rejected_for_carrying_no_eid_identity() {
-    // The older direct-DigiD koppelvlak put a sector-coded plaintext BSN in the
-    // Subject NameID (`s00000000:<bsn>`) and carried no eID attributes at all.
-    // This crate only speaks 4.4, where the identity arrives as an encrypted
-    // ActingSubjectID and the assertion must name our ServiceUUID. Accepting one
-    // of these would mean taking an identity from a profile we do not validate,
-    // so the checks that make 4.4 mandatory have to fire — nothing about the
-    // message's *status* betrays it, since it is a successful login.
+    // The pre-4.4 koppelvlak put a sector-coded plaintext BSN in the Subject
+    // NameID and carried no eID attributes. This crate only speaks 4.4, and
+    // nothing about the message's status betrays it — it is a successful login.
     let xml = load("artifact_response_digid_pre44.xml");
     assert!(xml.contains(STATUS_SUCCESS));
     assert!(xml.contains("s00000000:900029365"));
