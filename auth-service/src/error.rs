@@ -22,8 +22,8 @@ impl From<askama::Error> for AuthError {
     }
 }
 
-impl From<crate::saml::xml_parser::XmlError> for AuthError {
-    fn from(e: crate::saml::xml_parser::XmlError) -> Self {
+impl From<crate::saml::xml::XmlError> for AuthError {
+    fn from(e: crate::saml::xml::XmlError) -> Self {
         AuthError::Xml(e.to_string())
     }
 }

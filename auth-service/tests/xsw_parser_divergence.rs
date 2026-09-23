@@ -1,6 +1,6 @@
-//! The signed bytes are parsed three times: by `run_chain`'s tree (roxmltree),
-//! again inside `verify_xml_signature`, and once more by the crypto backend
-//! (`uppsala`). Any construct those parsers read differently is a signature
+//! The signed bytes are parsed three times: by `run_chain`'s document (the
+//! quick-xml models), again inside `verify_xml_signature`, and once more by the
+//! crypto backend (`uppsala`). Any construct those parsers read differently is a signature
 //! wrapping vector: the digest covers one thing and the claims come from another.
 //!
 //! Every case here must either be rejected or yield exactly the genuine claims.
@@ -133,7 +133,7 @@ fn xml_id_on_the_root_fails_closed() {
     );
 }
 
-/// Comments are excluded from both exclusive c14n and the parsed tree, so a
+/// Comments are excluded from both exclusive c14n and the parsed models, so a
 /// comment splitting an identity string must not smuggle one past either.
 #[test]
 fn comments_inside_identity_text_do_not_forge_a_value() {
@@ -167,8 +167,10 @@ fn comments_inside_identity_text_do_not_forge_a_value() {
     }
 }
 
-/// An identity wrapped in a child element is not that identity: `direct_text`
-/// must not fold child text into `Issuer` / `NameID` / `AuthnContextClassRef`.
+/// An identity wrapped in a child element is not that identity: child text is
+/// never folded into `Issuer` / `NameID` / `AuthnContextClassRef`. A text field
+/// with element children does not deserialize, so the message is refused at the
+/// model before any binding check runs.
 #[test]
 fn identity_text_inside_a_child_element_is_not_read_as_the_identity() {
     let rd_key = load_key("rd-signing-1");
@@ -191,8 +193,8 @@ fn identity_text_inside_a_child_element_is_not_read_as_the_identity() {
         result
             .errors
             .iter()
-            .any(|e| e.contains("Issuer contains child elements")),
-        "expected the direct-text rejection, got: {:?}",
+            .any(|e| e.contains("failed to unwrap SOAP envelope") && e.contains("wrap")),
+        "expected the model to refuse the nested Issuer, got: {:?}",
         result.errors
     );
 }

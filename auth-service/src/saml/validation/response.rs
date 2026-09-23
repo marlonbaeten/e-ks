@@ -1,10 +1,11 @@
 //! Inner Response validation (eID §7.6.2).
 
-use super::helpers::{Validator, child_element};
+use super::helpers::Validator;
 use crate::{
     saml::{
         constants::{NS_SAML, STATUS_SUCCESS},
-        xml_parser::{Document, NodeId, children_by_tag, find_descendant},
+        model::{Assertion, Response},
+        xml::Document,
     },
     types::{EndpointUrl, EntityId},
 };
@@ -28,29 +29,26 @@ pub struct ValidateResponseOpts<'a> {
     pub expected_issuer: Option<&'a EntityId>,
 }
 
-/// Validate the Response element `response` within the already-parsed document
-/// `doc` (eID §7.6.2) and return the inner Assertion node.
+/// Validate `response`, read from the already-parsed document `doc` (eID
+/// §7.6.2), and return its Assertion.
 ///
 /// eID §7.6.2: Response MUST contain Status with StatusCode; if not Success, a
 /// second-level StatusCode SHOULD be present (§7.8). Assertion MUST be present on
 /// Success; EncryptedAssertion MUST NOT be included. `@Destination` MUST match the
 /// recipient ACS and Issuer MUST be the RD EntityID (checked when supplied).
-pub fn validate_response_at(
+pub fn validate_response_at<'r>(
     doc: &Document,
-    response: NodeId,
+    response: &'r Response,
     opts: &ValidateResponseOpts<'_>,
     errors: &mut Vec<String>,
-) -> Option<NodeId> {
+) -> Option<&'r Assertion> {
     let mut v = Validator::new(doc, errors);
-    v.check_version(response, "Response");
+    v.check_version(response.version.as_deref(), "Response");
 
     // Bound how stale the Response envelope may be (it carries no Conditions).
-    v.check_freshness(
-        doc.get_attribute(response, "IssueInstant"),
-        "Response @IssueInstant",
-    );
+    v.check_freshness(response.issue_instant.as_deref(), "Response @IssueInstant");
 
-    let status_code = v.check_status_success(response, "Response");
+    let status_code = v.check_status_success(response.status.as_ref(), "Response");
     debug!(
         "[validate] Response status_code={:?}",
         status_code.as_deref()
@@ -58,18 +56,22 @@ pub fn validate_response_at(
 
     // eID §7.6.2: EncryptedAssertion MUST NOT be included (the Assertion travels
     // in plaintext inside the RD-signed ArtifactResponse; only the SubjectIDs are
-    // encrypted, per §7.6.3.4).
-    if find_descendant(doc, response, NS_SAML, "EncryptedAssertion").is_some() {
+    // encrypted, per §7.6.3.4). Searched anywhere in the Response, not just where
+    // the schema puts it.
+    if doc
+        .descendants(response.element)
+        .any(|e| e.is(NS_SAML, "EncryptedAssertion"))
+    {
         v.error("Response contains an EncryptedAssertion, which eID §7.6.2 forbids".to_string());
     }
 
-    v.check_destination(response, opts.expected_destination);
+    v.check_destination(response.destination.as_deref(), opts.expected_destination);
 
     // eID §7.6.2: Issuer MUST be the RD EntityID. Mirrors the assertion-level
     // Issuer binding (§7.6.3.5 r1).
-    v.check_issuer(response, opts.expected_issuer, "Response");
+    v.check_issuer(response.issuer.as_deref(), opts.expected_issuer, "Response");
 
-    let assertion = v.extract_assertion(response, status_code.as_deref());
+    let assertion = v.extract_assertion(&response.assertions, status_code.as_deref());
     debug!(
         "[validate] Response done: valid={}, errors={}",
         errors.is_empty(),
@@ -84,14 +86,11 @@ impl Validator<'_, '_> {
     // delivered to. Mirrors the assertion-level Recipient binding (§7.6.3.5 r2).
     //
     // `expected: None` skips the check entirely; see `ValidateResponseOpts`.
-    fn check_destination(&mut self, response: NodeId, expected: Option<&EndpointUrl>) {
+    fn check_destination(&mut self, destination: Option<&str>, expected: Option<&EndpointUrl>) {
         let Some(expected) = expected else {
             return;
         };
-        let destination = self
-            .doc
-            .get_attribute(response, "Destination")
-            .unwrap_or("");
+        let destination = destination.unwrap_or("");
         debug!("[validate] Response Destination='{destination}' (expected='{expected}')");
         if destination != expected.as_str() {
             self.error(format!(
@@ -103,10 +102,12 @@ impl Validator<'_, '_> {
     // eID §7.6.2 (Assertion cardinality 0..1, conditional): the Assertion MUST be
     // present when the status is Success and MUST NOT be included otherwise; more
     // than one is ambiguous and rejected rather than silently picking the first.
-    fn extract_assertion(&mut self, response: NodeId, status_code: Option<&str>) -> Option<NodeId> {
-        // Extract the Assertion from the PARSED tree (comment-safe, anti-XSW; see
-        // `child_element`).
-        let assertion = child_element(self.doc, response, NS_SAML, "Assertion");
+    fn extract_assertion<'r>(
+        &mut self,
+        assertions: &'r [Assertion],
+        status_code: Option<&str>,
+    ) -> Option<&'r Assertion> {
+        let assertion = assertions.first();
         debug!(
             "[validate] Extracted Assertion: present={}",
             assertion.is_some()
@@ -122,10 +123,10 @@ impl Validator<'_, '_> {
                     .to_string(),
             );
         }
-        let assertion_count = children_by_tag(self.doc, response, NS_SAML, "Assertion").len();
-        if assertion_count > 1 {
+        if assertions.len() > 1 {
             self.error(format!(
-                "Response carries {assertion_count} Assertion elements (at most one is allowed)"
+                "Response carries {} Assertion elements (at most one is allowed)",
+                assertions.len()
             ));
         }
         assertion
@@ -135,7 +136,7 @@ impl Validator<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saml::{constants::NS_SAMLP, xml_parser::parse};
+    use crate::saml::constants::NS_SAMLP;
     use chrono::Utc;
 
     /// A SAML timestamp `offset` from now, for the mandatory `@IssueInstant`.
@@ -146,14 +147,10 @@ mod tests {
     }
 
     /// Parse `xml` and run [`validate_response_at`] over its root, returning
-    /// `(valid, errors, assertion_source)`.
-    fn run(
-        xml: &str,
-        dest: Option<&str>,
-        issuer: Option<&str>,
-    ) -> (bool, Vec<String>, Option<String>) {
-        let doc = parse(xml).expect("test XML parses");
-        let root = doc.document_element();
+    /// `(valid, errors, assertion_present)`.
+    fn run(xml: &str, dest: Option<&str>, issuer: Option<&str>) -> (bool, Vec<String>, bool) {
+        let doc = Document::parse(xml).expect("test XML parses");
+        let response: Response = doc.deserialize().expect("test Response deserializes");
         let mut errors = Vec::new();
         let dest = dest.map(|d| EndpointUrl::from_metadata(d, "ACS").expect("test ACS URL"));
         let issuer = issuer.map(|i| EntityId::parse(i).expect("test issuer"));
@@ -161,9 +158,8 @@ mod tests {
             expected_destination: dest.as_ref(),
             expected_issuer: issuer.as_ref(),
         };
-        let assertion = validate_response_at(&doc, root, &opts, &mut errors);
-        let assertion_xml = assertion.and_then(|n| doc.node_source(n).map(str::to_string));
-        (errors.is_empty(), errors, assertion_xml)
+        let assertion = validate_response_at(&doc, &response, &opts, &mut errors);
+        (errors.is_empty(), errors, assertion.is_some())
     }
 
     #[test]
@@ -172,9 +168,9 @@ mod tests {
             r#"<samlp:Response xmlns:samlp="{NS_SAMLP}" Version="2.0" IssueInstant="{now}"><samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status><saml:Assertion xmlns:saml="{NS_SAML}" ID="_a1">data</saml:Assertion></samlp:Response>"#,
             now = ts(chrono::Duration::zero())
         );
-        let (valid, errors, assertion_xml) = run(&xml, None, None);
+        let (valid, errors, assertion) = run(&xml, None, None);
         assert!(valid, "Errors: {errors:?}");
-        assert!(assertion_xml.is_some());
+        assert!(assertion);
     }
 
     #[test]
@@ -288,7 +284,7 @@ mod tests {
             now = ts(chrono::Duration::zero())
         );
         let (_valid, errors, assertion) = run(&xml, None, None);
-        assert!(assertion.is_none());
+        assert!(!assertion);
         // The status is reported (that is how the caller learns it was a
         // cancellation), but the missing Assertion is not itself an error.
         assert!(

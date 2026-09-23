@@ -9,10 +9,8 @@ use crate::{
     saml::{
         constants::NS_DSIG,
         crypto::{self, SignatureVerification},
-        xml_parser::{
-            Document, NodeId, QName, all_elements, children_by_tag, descendants_by_tag,
-            direct_text, find_descendant,
-        },
+        model::{Signature, Signed, SignedInfo},
+        xml::{Document, QName},
     },
 };
 use tracing::debug;
@@ -42,7 +40,7 @@ const ALLOWED_DIGEST_METHODS: &[&str] = &[
 // c14n method without comments". Pinning this matters for more than tidiness: a
 // `WithComments` canonicalization would pull comment nodes into the digest, so
 // the bytes the signature covers would stop matching the comment-free view the
-// validators navigate (see `xml_parser`), which is exactly the gap the XSW
+// validators read (see `xml`), which is exactly the gap the XSW
 // comment-injection tests probe.
 const EXCLUSIVE_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
@@ -54,10 +52,10 @@ const ENVELOPED_SIGNATURE_TRANSFORM: &str = "http://www.w3.org/2000/09/xmldsig#e
 
 // Attribute names that name an element for a `#id` reference. Must stay aligned
 // with the backend's ID map so both resolve a reference the same way;
-// `get_attribute` matches by local name, so `"id"` also covers `xml:id`.
+// `Element::attribute` matches by local name, so `"id"` also covers `xml:id`.
 const ID_ATTRIBUTES: &[&str] = &["ID", "Id", "id", "AssertionID"];
 
-/// The element the caller is about to consume, read from the caller's own tree.
+/// The element the caller is about to consume, read from the caller's own parse.
 ///
 /// SECURITY (XSW): [`verify_xml_signature`] re-parses its input and the backend
 /// parses it again with a different parser, so "the element I extracted" and "the
@@ -101,7 +99,7 @@ pub fn verify_xml_signature(
     let mut errors = Vec::new();
     // Parse the XML once; the document is used for key matching, signature
     // enumeration, algorithm checks and the Reference-covers-root check.
-    match crate::saml::xml_parser::parse(xml) {
+    match Document::parse(xml) {
         Ok(doc) => SignatureChecks::new(&doc, &mut errors).check_and_verify(
             xml,
             trusted_keys,
@@ -150,33 +148,36 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
         trusted_keys: &[KeyPair],
         expected_root: &ExpectedRoot<'_>,
     ) {
-        let root = self.doc.document_element();
-        if !self.check_expected_root(root, expected_root) {
+        if !self.check_expected_root(expected_root) {
             return;
         }
-        let sig_node = match self.enveloping_signature(root) {
-            Ok(n) => n,
+        let signed = match self.doc.deserialize::<Signed>() {
+            Ok(signed) => signed,
+            Err(e) => {
+                self.error(format!("Malformed ds:Signature: {e}"));
+                return;
+            }
+        };
+        let sig = match self.enveloping_signature(&signed.signatures) {
+            Ok(sig) => sig,
             Err(e) => {
                 self.error(e);
                 return;
             }
         };
-        if let Some(key) = self.find_matching_key(sig_node, trusted_keys)
-            && self.check_signature_algorithms(sig_node)
-            && self.signature_covers_root(root, sig_node)
+        if let Some(key) = self.find_matching_key(sig, trusted_keys)
+            && self.check_signature_algorithms(sig)
+            && self.signature_covers_root(sig)
         {
             self.verify_with_cert(xml, key);
         }
     }
 
     /// SECURITY (XSW): require this parse's root to be the same element the caller
-    /// extracted from its own tree. Runs first, so a mismatch never reaches the
+    /// extracted from its own parse. Runs first, so a mismatch never reaches the
     /// crypto backend. See [`ExpectedRoot`].
-    fn check_expected_root(&mut self, root: NodeId, expected: &ExpectedRoot<'_>) -> bool {
-        let Some(actual) = self.doc.node_qname(root) else {
-            self.error("Signed document has no root element".to_string());
-            return false;
-        };
+    fn check_expected_root(&mut self, expected: &ExpectedRoot<'_>) -> bool {
+        let actual = self.doc.root().qname();
         let wanted = QName {
             namespace: Some(expected.namespace),
             local_name: expected.local_name,
@@ -189,7 +190,7 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
             return false;
         }
         if let Some(expected_id) = expected.id {
-            let root_id = self.root_id(root);
+            let root_id = self.root_id();
             if root_id.as_deref() != Some(expected_id) {
                 self.error(format!(
                     "Signed root element ID {root_id:?} does not match the ID {expected_id:?} the \
@@ -217,9 +218,9 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
         }
     }
 
-    /// Locate the single *enveloping* `<Signature>` (a direct child of `root`)
-    /// and require it to be the first `<Signature>` in the whole document; a
-    /// structural violation is returned as the error message.
+    /// The single *enveloping* `<Signature>` (a direct child of the root), which
+    /// must also be the first `<Signature>` in the whole document; a structural
+    /// violation is returned as the error message.
     ///
     /// eID §7.6.1/§7.6.3: verify only the *enveloping* signature. Nested
     /// signatures belong to nested elements signed by a different party (e.g.
@@ -238,22 +239,24 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     /// the whole document so the backend verifies exactly the signature we
     /// authorize. Genuine eID messages always place it first (Issuer ->
     /// Signature -> Status/Response), so this only rejects wrapped documents.
-    fn enveloping_signature(&self, root: NodeId) -> Result<NodeId, String> {
-        let sig_nodes = children_by_tag(self.doc, root, NS_DSIG, "Signature");
+    fn enveloping_signature<'s>(
+        &self,
+        signatures: &'s [Signature],
+    ) -> Result<&'s Signature, String> {
         debug!(
             "[verify] Found {} enveloping Signature element(s) on <{}>",
-            sig_nodes.len(),
-            self.doc.local_name(root).unwrap_or_default()
+            signatures.len(),
+            self.doc.root().qname()
         );
-        let [sig] = sig_nodes[..] else {
-            return Err(match sig_nodes.len() {
+        let [sig] = signatures else {
+            return Err(match signatures.len() {
                 0 => "No ds:Signature element found".to_string(),
                 n => format!("Expected exactly one enveloping ds:Signature, found {n}"),
             });
         };
 
-        let all_sigs = descendants_by_tag(self.doc, root, NS_DSIG, "Signature");
-        if all_sigs.first() != Some(&sig) {
+        let first = self.doc.elements().position(|e| e.is(NS_DSIG, "Signature"));
+        if first != Some(sig.element.index()) {
             return Err(
                 "A nested ds:Signature precedes the enveloping signature: the backend would \
                  verify a different signature than the enveloping one (possible XML signature \
@@ -269,19 +272,25 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     // in the permitted set. Returns `false` (and records an error) on any
     // disallowed or missing algorithm so a weak signature is not trusted even if
     // the crypto backend could verify it.
-    fn check_signature_algorithms(&mut self, sig: NodeId) -> bool {
+    fn check_signature_algorithms(&mut self, sig: &Signature) -> bool {
+        let Some(signed_info) = &sig.signed_info else {
+            self.error("Signature has no SignedInfo".to_string());
+            return false;
+        };
         // Evaluate all four so every violation is reported, not just the first.
-        let sig_method_ok = self.check_signature_method(sig);
-        let digests_ok = self.check_digest_methods(sig);
-        let c14n_ok = self.check_canonicalization_method(sig);
-        let transforms_ok = self.check_reference_transforms(sig);
+        let sig_method_ok = self.check_signature_method(signed_info);
+        let digests_ok = self.check_digest_methods(signed_info);
+        let c14n_ok = self.check_canonicalization_method(signed_info);
+        let transforms_ok = self.check_reference_transforms(signed_info);
         sig_method_ok && digests_ok && c14n_ok && transforms_ok
     }
 
     // eID §9.1: the SignatureMethod MUST be RSA-SHA256 or stronger (no SHA-1).
-    fn check_signature_method(&mut self, sig: NodeId) -> bool {
-        match find_descendant(self.doc, sig, NS_DSIG, "SignatureMethod")
-            .and_then(|n| self.doc.get_attribute(n, "Algorithm"))
+    fn check_signature_method(&mut self, signed_info: &SignedInfo) -> bool {
+        match signed_info
+            .signature_method
+            .as_ref()
+            .and_then(|m| m.algorithm.as_deref())
         {
             Some(a) if ALLOWED_SIGNATURE_METHODS.contains(&a) => true,
             Some(a) => {
@@ -298,24 +307,27 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     }
 
     // eID §9.1: every Reference DigestMethod MUST be SHA-256 or stronger.
-    fn check_digest_methods(&mut self, sig: NodeId) -> bool {
+    fn check_digest_methods(&mut self, signed_info: &SignedInfo) -> bool {
         let mut ok = true;
-        let digests = descendants_by_tag(self.doc, sig, NS_DSIG, "DigestMethod");
-        if digests.is_empty() {
+        if signed_info.references.is_empty() {
             self.error("Signature has no DigestMethod".to_string());
             ok = false;
         }
-        for d in digests {
-            match self.doc.get_attribute(d, "Algorithm") {
-                Some(a) if ALLOWED_DIGEST_METHODS.contains(&a) => {}
-                Some(a) => {
+        for r in &signed_info.references {
+            match r.digest_method.as_ref().map(|d| d.algorithm.as_deref()) {
+                Some(Some(a)) if ALLOWED_DIGEST_METHODS.contains(&a) => {}
+                Some(Some(a)) => {
                     self.error(format!(
                         "Disallowed DigestMethod (eID §9.1 requires SHA-256 or stronger): {a}"
                     ));
                     ok = false;
                 }
-                None => {
+                Some(None) => {
                     self.error("DigestMethod has no Algorithm".to_string());
+                    ok = false;
+                }
+                None => {
+                    self.error("Signature Reference has no DigestMethod".to_string());
                     ok = false;
                 }
             }
@@ -324,9 +336,11 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     }
 
     // eID §9.1: exclusive c14n without comments, on the SignedInfo itself.
-    fn check_canonicalization_method(&mut self, sig: NodeId) -> bool {
-        match find_descendant(self.doc, sig, NS_DSIG, "CanonicalizationMethod")
-            .and_then(|n| self.doc.get_attribute(n, "Algorithm"))
+    fn check_canonicalization_method(&mut self, signed_info: &SignedInfo) -> bool {
+        match signed_info
+            .canonicalization_method
+            .as_ref()
+            .and_then(|m| m.algorithm.as_deref())
         {
             Some(EXCLUSIVE_C14N) => true,
             Some(a) => {
@@ -351,13 +365,13 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     // all of which select an arbitrary node-set to digest. Any of those would let
     // a Reference name `#<root-id>`, passing `signature_covers_root`, while
     // digesting something narrower.
-    fn check_reference_transforms(&mut self, sig: NodeId) -> bool {
+    fn check_reference_transforms(&mut self, signed_info: &SignedInfo) -> bool {
         let mut ok = true;
-        for r in descendants_by_tag(self.doc, sig, NS_DSIG, "Reference") {
-            let nodes = descendants_by_tag(self.doc, r, NS_DSIG, "Transform");
-            let mut transforms = Vec::with_capacity(nodes.len());
+        for r in &signed_info.references {
+            let nodes = r.transforms.iter().flat_map(|t| &t.transforms);
+            let mut transforms = Vec::new();
             for t in nodes {
-                match self.doc.get_attribute(t, "Algorithm") {
+                match t.algorithm.as_deref() {
                     Some(a) => transforms.push(a),
                     None => {
                         self.error("Signature Reference Transform has no Algorithm".to_string());
@@ -369,7 +383,6 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
         }
         ok
     }
-
     /// The eID §9.1 transform allow-list, applied to one Reference in order.
     fn check_transform_list(&mut self, transforms: &[&str]) -> bool {
         let mut ok = true;
@@ -425,24 +438,22 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     }
 
     // SECURITY (XSW): every `<Reference>` of the enveloping signature MUST
-    // target the root element `root` (the element whose data the caller
-    // consumes). Accepts an empty URI (whole document) or `#<id>` where `<id>`
-    // is the root's ID attribute. Returns `false` (and records an error) on a
-    // missing or off-root reference, so a signature whose digest matches a
+    // target the root element (the element whose data the caller consumes).
+    // Accepts an empty URI (whole document) or `#<id>` where `<id>` is the
+    // root's ID attribute. Returns `false` (and records an error) on a missing
+    // or off-root reference, so a signature whose digest matches a
     // sibling/nested element cannot authenticate a forged root wrapped around
     // it.
-    fn signature_covers_root(&mut self, root: NodeId, sig: NodeId) -> bool {
-        let root_id = self.root_id(root);
+    fn signature_covers_root(&mut self, sig: &Signature) -> bool {
+        let root_id = self.root_id();
 
-        let refs = descendants_by_tag(self.doc, sig, NS_DSIG, "Reference");
-        if refs.is_empty() {
-            self.error("Signature has no Reference".to_string());
-            return false;
-        }
+        let refs = sig.signed_info.iter().flat_map(|si| &si.references);
+        let mut any = false;
         for r in refs {
-            let uri = self.doc.get_attribute(r, "URI").unwrap_or("");
+            any = true;
+            let uri = r.uri.as_deref().unwrap_or("");
             if uri.is_empty() {
-                continue; // whole document, which is rooted at `root`
+                continue; // whole document, which is rooted at the root
             }
             let targets_root = root_id
                 .as_deref()
@@ -455,19 +466,23 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
                 return false;
             };
             // Names the root's ID, but uniquely only if nothing else carries it.
-            if !self.check_id_is_unique(root, id) {
+            if !self.check_id_is_unique(id) {
                 return false;
             }
         }
-        true
+        if !any {
+            self.error("Signature has no Reference".to_string());
+        }
+        any
     }
 
     /// The root's ID under any [`ID_ATTRIBUTES`] name. Owned so callers can hold
     /// it across an `error()` call.
-    fn root_id(&self, root: NodeId) -> Option<String> {
+    fn root_id(&self) -> Option<String> {
+        let root = self.doc.root();
         ID_ATTRIBUTES
             .iter()
-            .find_map(|a| self.doc.get_attribute(root, a))
+            .find_map(|a| root.attribute(a))
             .map(str::to_owned)
     }
 
@@ -475,17 +490,16 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     /// exactly one element carries that ID, else the backend could resolve to one
     /// element while we consume another. The backend rejects duplicate IDs too;
     /// this is our own guarantee rather than an inherited one.
-    fn check_id_is_unique(&mut self, root: NodeId, id: &str) -> bool {
-        let carriers: Vec<NodeId> = all_elements(self.doc)
-            .into_iter()
-            .filter(|&n| {
-                ID_ATTRIBUTES
-                    .iter()
-                    .any(|a| self.doc.get_attribute(n, a) == Some(id))
-            })
+    fn check_id_is_unique(&mut self, id: &str) -> bool {
+        let carriers: Vec<usize> = self
+            .doc
+            .elements()
+            .enumerate()
+            .filter(|(_, e)| ID_ATTRIBUTES.iter().any(|a| e.attribute(a) == Some(id)))
+            .map(|(i, _)| i)
             .collect();
         match carriers.as_slice() {
-            [only] if *only == root => true,
+            [0] => true,
             [_] => {
                 self.error(format!(
                     "Signature Reference URI {id:?} resolves to an element other than the signed \
@@ -509,29 +523,14 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
     // rejected. Returns the matched key.
     fn find_matching_key<'k>(
         &mut self,
-        sig: NodeId,
+        sig: &Signature,
         trusted: &'k [KeyPair],
     ) -> Option<&'k KeyPair> {
-        let found = if let Some(key_name_node) = find_descendant(self.doc, sig, NS_DSIG, "KeyName")
-        {
-            // `direct_text`: the key selector is the element's own text only.
-            match direct_text(self.doc, key_name_node) {
-                Some(name) => self.key_by_name(&name, trusted),
-                None => {
-                    self.error("Signature KeyInfo KeyName contains child elements".to_string());
-                    None
-                }
-            }
-        } else if let Some(x509_node) = find_descendant(self.doc, sig, NS_DSIG, "X509Certificate") {
-            match direct_text(self.doc, x509_node) {
-                Some(cert) => self.key_by_cert(&cert, trusted),
-                None => {
-                    self.error(
-                        "Signature KeyInfo X509Certificate contains child elements".to_string(),
-                    );
-                    None
-                }
-            }
+        let key_info = sig.key_info.as_ref();
+        let found = if let Some(name) = key_info.and_then(|k| k.key_names.first()) {
+            self.key_by_name(name, trusted)
+        } else if let Some(cert) = key_info.and_then(|k| k.certificate()) {
+            self.key_by_cert(cert, trusted)
         } else {
             self.error(
                 "Signature KeyInfo contains neither KeyName nor X509Certificate".to_string(),
@@ -546,7 +545,6 @@ impl<'a, 'input> SignatureChecks<'a, 'input> {
         }
         found
     }
-
     fn key_by_name<'k>(&mut self, key_name: &str, trusted: &'k [KeyPair]) -> Option<&'k KeyPair> {
         let key_name = key_name.trim();
         if let Some(found) = trusted.iter().find(|kp| kp.matches_key_name(key_name)) {
@@ -586,6 +584,28 @@ mod tests {
         )
     }
 
+    /// Parse `xml` and run `check` on its root element as a `ds:Signature`.
+    fn with_signature<T>(
+        xml: &str,
+        check: impl FnOnce(&mut SignatureChecks, &Signature) -> T,
+    ) -> (T, Vec<String>) {
+        let doc = Document::parse(xml).unwrap();
+        let sig: Signature = doc.deserialize().unwrap();
+        let mut errors = Vec::new();
+        let out = check(&mut SignatureChecks::new(&doc, &mut errors), &sig);
+        (out, errors)
+    }
+
+    /// Run `signature_covers_root` on the root's enveloping `ds:Signature`.
+    fn covers_root(xml: &str) -> (bool, Vec<String>) {
+        let doc = Document::parse(xml).unwrap();
+        let signed: Signed = doc.deserialize().unwrap();
+        let mut errors = Vec::new();
+        let ok =
+            SignatureChecks::new(&doc, &mut errors).signature_covers_root(&signed.signatures[0]);
+        (ok, errors)
+    }
+
     // A self-contained test certificate (never used for real signing).
     const TEST_PEM: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -620,12 +640,11 @@ mod tests {
         let xml = format!(
             r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyInfo><KeyName>{sha256}</KeyName></KeyInfo></Signature>"#
         );
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let sig = doc.document_element();
-        let mut errors = Vec::new();
-        let found = SignatureChecks::new(&doc, &mut errors)
-            .find_matching_key(sig, std::slice::from_ref(&kp));
-        assert!(found.is_some(), "SHA-256 KeyName should match: {errors:?}");
+        let (found, errors) = with_signature(&xml, |c, sig| {
+            c.find_matching_key(sig, std::slice::from_ref(&kp))
+                .is_some()
+        });
+        assert!(found, "SHA-256 KeyName should match: {errors:?}");
     }
 
     /// A standalone `<Signature>` carrying just the algorithm declarations
@@ -641,10 +660,10 @@ mod tests {
     }
 
     fn algorithm_errors(xml: &str) -> (bool, Vec<String>) {
-        let doc = crate::saml::xml_parser::parse(xml).unwrap();
-        let sig = doc.document_element();
+        let doc = Document::parse(xml).unwrap();
+        let sig: Signature = doc.deserialize().unwrap();
         let mut errors = Vec::new();
-        let ok = SignatureChecks::new(&doc, &mut errors).check_signature_algorithms(sig);
+        let ok = SignatureChecks::new(&doc, &mut errors).check_signature_algorithms(&sig);
         (ok, errors)
     }
 
@@ -652,7 +671,7 @@ mod tests {
     fn check_signature_algorithms_requires_exclusive_c14n() {
         // eID §9.1: exclusive c14n WITHOUT comments. The WithComments variant
         // would pull comments into the digest, breaking the equivalence between
-        // what is signed and the comment-free tree the validators read.
+        // what is signed and the comment-free models the validators read.
         let (ok, errors) = algorithm_errors(&signed_info(
             "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
             "http://www.w3.org/2001/04/xmlenc#sha256",
@@ -798,14 +817,8 @@ mod tests {
             EXCLUSIVE_C14N,
             &[ENVELOPED_SIGNATURE_TRANSFORM, EXCLUSIVE_C14N],
         );
-        let ok_xml = ok_xml.as_str();
-        let doc = crate::saml::xml_parser::parse(ok_xml).unwrap();
-        let sig = doc.document_element();
-        let mut errors = Vec::new();
-        assert!(
-            SignatureChecks::new(&doc, &mut errors).check_signature_algorithms(sig),
-            "{errors:?}"
-        );
+        let (ok, errors) = algorithm_errors(&ok_xml);
+        assert!(ok, "{errors:?}");
 
         // rsa-sha1 SignatureMethod + sha1 DigestMethod must both be rejected.
         let sha1_xml = signed_info(
@@ -814,11 +827,8 @@ mod tests {
             EXCLUSIVE_C14N,
             &[ENVELOPED_SIGNATURE_TRANSFORM, EXCLUSIVE_C14N],
         );
-        let sha1_xml = sha1_xml.as_str();
-        let doc = crate::saml::xml_parser::parse(sha1_xml).unwrap();
-        let sig = doc.document_element();
-        let mut errors = Vec::new();
-        assert!(!SignatureChecks::new(&doc, &mut errors).check_signature_algorithms(sig));
+        let (ok, errors) = algorithm_errors(&sha1_xml);
+        assert!(!ok);
         assert!(errors.iter().any(|e| e.contains("SignatureMethod")));
         assert!(errors.iter().any(|e| e.contains("DigestMethod")));
     }
@@ -830,26 +840,16 @@ mod tests {
             let xml = format!(
                 r##"<Root xmlns="x" ID="_root"><Signature xmlns="{NS_DSIG}"><SignedInfo><Reference URI="{uri}"/></SignedInfo></Signature></Root>"##
             );
-            let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-            let root = doc.document_element();
-            let sig =
-                crate::saml::xml_parser::find_child(&doc, root, NS_DSIG, "Signature").unwrap();
-            let mut errors = Vec::new();
-            assert!(
-                SignatureChecks::new(&doc, &mut errors).signature_covers_root(root, sig),
-                "{errors:?}"
-            );
+            let (ok, errors) = covers_root(&xml);
+            assert!(ok, "{errors:?}");
         }
 
         // A reference to a sibling/other id must be rejected (XSW wrapping).
         let xml = format!(
             r##"<Root xmlns="x" ID="_root"><Signature xmlns="{NS_DSIG}"><SignedInfo><Reference URI="#_sibling"/></SignedInfo></Signature></Root>"##
         );
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let root = doc.document_element();
-        let sig = crate::saml::xml_parser::find_child(&doc, root, NS_DSIG, "Signature").unwrap();
-        let mut errors = Vec::new();
-        assert!(!SignatureChecks::new(&doc, &mut errors).signature_covers_root(root, sig));
+        let (ok, errors) = covers_root(&xml);
+        assert!(!ok);
         assert!(errors.iter().any(|e| e.contains("wrapping")));
     }
 
@@ -940,11 +940,8 @@ mod tests {
         let xml = format!(
             r##"<Root xmlns="urn:x" ID="_root"><Forged id="_root"/><Signature xmlns="{NS_DSIG}"><SignedInfo><Reference URI="#_root"/></SignedInfo></Signature></Root>"##
         );
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let root = doc.document_element();
-        let sig = crate::saml::xml_parser::find_child(&doc, root, NS_DSIG, "Signature").unwrap();
-        let mut errors = Vec::new();
-        assert!(!SignatureChecks::new(&doc, &mut errors).signature_covers_root(root, sig));
+        let (ok, errors) = covers_root(&xml);
+        assert!(!ok);
         assert!(
             errors
                 .iter()
@@ -953,26 +950,28 @@ mod tests {
         );
     }
 
-    /// A key name is the element's own text, not text folded up from children.
+    /// A key name is the element's own text, not text folded up from children:
+    /// a KeyName with element children makes the signature malformed.
     #[test]
     fn key_name_with_child_elements_is_rejected() {
         let kp = key_pair(TEST_PEM);
         let sha256 = kp.cert_pem.key_names()[1].clone();
         let xml = format!(
-            r#"<Signature xmlns="{NS_DSIG}"><KeyInfo><KeyName><x>{sha256}</x></KeyName></KeyInfo></Signature>"#
+            r##"<samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}" ID="_r"><Signature xmlns="{NS_DSIG}"><KeyInfo><KeyName><x>{sha256}</x></KeyName></KeyInfo></Signature></samlp:ArtifactResponse>"##
         );
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let sig = doc.document_element();
-        let mut errors = Vec::new();
+        let expected = ExpectedRoot {
+            namespace: NS_SAMLP,
+            local_name: "ArtifactResponse",
+            id: Some("_r"),
+        };
+        let result = verify_xml_signature(&xml, std::slice::from_ref(&kp), &expected);
         assert!(
-            SignatureChecks::new(&doc, &mut errors)
-                .find_matching_key(sig, std::slice::from_ref(&kp))
-                .is_none(),
-            "a KeyName whose text comes from a child element must not select a key"
-        );
-        assert!(
-            errors.iter().any(|e| e.contains("contains child elements")),
-            "{errors:?}"
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("Malformed ds:Signature")),
+            "a KeyName whose text comes from a child element must not select a key: {:?}",
+            result.errors
         );
     }
 
@@ -980,14 +979,11 @@ mod tests {
     fn find_matching_key_reports_unknown_key_name() {
         let kp = key_pair(TEST_PEM);
         let xml = r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyInfo><KeyName>deadbeef</KeyName></KeyInfo></Signature>"#;
-        let doc = crate::saml::xml_parser::parse(xml).unwrap();
-        let sig = doc.document_element();
-        let mut errors = Vec::new();
-        assert!(
-            SignatureChecks::new(&doc, &mut errors)
-                .find_matching_key(sig, std::slice::from_ref(&kp))
-                .is_none()
-        );
+        let (found, errors) = with_signature(xml, |c, sig| {
+            c.find_matching_key(sig, std::slice::from_ref(&kp))
+                .is_some()
+        });
+        assert!(!found);
         assert!(errors[0].contains("Unknown KeyName"));
     }
 }

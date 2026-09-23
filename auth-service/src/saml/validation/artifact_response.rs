@@ -1,12 +1,13 @@
 //! SOAP-wrapped ArtifactResponse validation (eID §7.6.1).
 
-use super::helpers::{Validator, child_element};
+use super::helpers::Validator;
 use crate::{
     keys::KeyPair,
     saml::{
         constants::{NS_SAMLP, STATUS_SUCCESS},
+        model::{ArtifactResponse, Response},
         verification::{ExpectedRoot, verify_xml_signature},
-        xml_parser::{Document, NodeId, children_by_tag},
+        xml::Document,
     },
     types::{EntityId, MessageId},
 };
@@ -24,46 +25,44 @@ pub struct ValidateArtifactResponseOpts<'a> {
     pub expected_issuer: Option<&'a EntityId>,
 }
 
-/// Validate the ArtifactResponse element `art_node` within the already-parsed
-/// document `doc` (eID §7.6.1) and return the inner Response node.
+/// Validate `art`, read from the already-parsed document `doc` (eID §7.6.1),
+/// and return its inner Response.
 ///
 /// Checks (all §7.6.1): `@Version`, signature, Issuer, InResponseTo, status code
 /// and `@IssueInstant` staleness.
 /// eID §9.2: the signature verification key MUST come from verified RD metadata.
-/// The whole signed document is parsed exactly once and navigated here, so no
-/// namespace-incomplete subtree is ever re-parsed.
-pub fn validate_artifact_response_at(
+/// The signature is verified over the source bytes of the very element `art`
+/// was read from, so what is verified is what the caller consumes.
+pub fn validate_artifact_response_at<'r>(
     doc: &Document,
-    art_node: NodeId,
+    art: &'r ArtifactResponse,
     opts: &ValidateArtifactResponseOpts<'_>,
     errors: &mut Vec<String>,
-) -> Option<NodeId> {
+) -> Option<&'r Response> {
     let mut v = Validator::new(doc, errors);
-    let root_name = doc.local_name(art_node).unwrap_or_default();
-    if root_name != "ArtifactResponse" {
-        let message = format!("Expected ArtifactResponse, got {root_name}");
-        v.error(message);
-    }
-
-    v.check_version(art_node, "ArtifactResponse");
-    v.check_signature(art_node, opts.trusted_keys);
+    v.check_version(art.version.as_deref(), "ArtifactResponse");
+    v.check_signature(art, opts.trusted_keys);
     // eID §7.6.1: the Issuer MUST be the RD EntityID. The signature is already
     // verified against an RD signing cert from metadata, but binding the Issuer
     // element mirrors the Response/Assertion checks and rejects a signed-by-RD
     // envelope whose Issuer nonetheless names a different entity.
-    v.check_issuer(art_node, opts.expected_issuer, "ArtifactResponse");
-    v.check_in_response_to(art_node, opts.expected_in_response_to);
+    v.check_issuer(
+        art.issuer.as_deref(),
+        opts.expected_issuer,
+        "ArtifactResponse",
+    );
+    v.check_in_response_to(art.in_response_to.as_deref(), opts.expected_in_response_to);
     // eID §7.6.1: require Success; the second-level StatusCode and StatusMessage
     // carry the actual reason and are composed into the error (§7.8).
-    let status_code = v.check_status_success(art_node, "ArtifactResponse");
+    let status_code = v.check_status_success(art.status.as_ref(), "ArtifactResponse");
 
     // Bound how stale the ArtifactResponse envelope may be (it carries no Conditions).
     v.check_freshness(
-        doc.get_attribute(art_node, "IssueInstant"),
+        art.issue_instant.as_deref(),
         "ArtifactResponse @IssueInstant",
     );
 
-    let response = v.extract_response(art_node, status_code.as_deref());
+    let response = v.extract_response(&art.responses, status_code.as_deref());
     debug!(
         "[validate] ArtifactResponse done: valid={}, errors={}",
         errors.is_empty(),
@@ -75,18 +74,18 @@ pub fn validate_artifact_response_at(
 /// The ArtifactResponse-level checks (eID §7.6.1), as methods on the shared
 /// [`Validator`].
 impl Validator<'_, '_> {
-    fn check_signature(&mut self, art_node: NodeId, trusted_keys: &[KeyPair]) {
+    fn check_signature(&mut self, art: &ArtifactResponse, trusted_keys: &[KeyPair]) {
         debug!("[validate] Verifying ArtifactResponse XML signature");
-        let Some(xml) = self.signed_element_source(art_node) else {
+        let Some(xml) = self.signed_element_source(art) else {
             return;
         };
         // SECURITY (XSW): these bytes get re-parsed twice more while the claims are
-        // read from *this* tree. Naming the element we consume makes "the signature
-        // covered what I read" a check, not an inference about byte ranges.
+        // read from *this* parse. Naming the element we consume makes "the
+        // signature covered what I read" a check, not an inference.
         let expected_root = ExpectedRoot {
             namespace: NS_SAMLP,
             local_name: "ArtifactResponse",
-            id: self.doc.get_attribute(art_node, "ID"),
+            id: art.id.as_deref(),
         };
         let sig_result = verify_xml_signature(&xml, trusted_keys, &expected_root);
         if !sig_result.is_valid() {
@@ -105,24 +104,13 @@ impl Validator<'_, '_> {
     ///
     /// The RD normally declares the SAML/dsig namespaces on the ArtifactResponse
     /// itself, so its raw bytes are used verbatim. When they are declared on an
-    /// ancestor instead the slice has undeclared prefixes, and the inherited
-    /// declarations are restored (digest-preserving under exclusive c14n, see
-    /// `node_source_with_inherited_namespaces`). The `ExpectedRoot` binding in
+    /// ancestor instead the inherited declarations are restored
+    /// (digest-preserving under exclusive c14n, see
+    /// [`Document::standalone_source`]). The `ExpectedRoot` binding in
     /// `check_signature` is what keeps that reconstruction honest.
-    fn signed_element_source(&mut self, art_node: NodeId) -> Option<String> {
-        let Some(raw) = self.doc.node_source(art_node) else {
-            self.error("ArtifactResponse sig: could not read element source".to_string());
-            return None;
-        };
-        if crate::saml::xml_parser::parse(raw).is_ok() {
-            return Some(raw.to_string());
-        }
-
-        let reconstructed = self
-            .doc
-            .node_source_with_inherited_namespaces(art_node)
-            .filter(|xml| crate::saml::xml_parser::parse(xml).is_ok());
-        if reconstructed.is_none() {
+    fn signed_element_source(&mut self, art: &ArtifactResponse) -> Option<String> {
+        let source = self.doc.standalone_source(art.element);
+        if source.is_none() {
             // Not a forgery signal but an RD serialization we cannot make
             // self-contained. Say so, or it surfaces as an opaque parse error.
             self.error(
@@ -130,20 +118,15 @@ impl Validator<'_, '_> {
                  its inherited namespace declarations restored (unexpected RD serialization)"
                     .to_string(),
             );
-        } else {
-            debug!(
-                "[validate] ArtifactResponse namespaces are declared on an ancestor; \
-                 restored inherited declarations for verification"
-            );
         }
-        reconstructed
+        source
     }
 
-    fn check_in_response_to(&mut self, root: NodeId, expected: Option<&MessageId>) {
+    fn check_in_response_to(&mut self, in_response_to: Option<&str>, expected: Option<&MessageId>) {
         let Some(expected) = expected else {
             return;
         };
-        let in_response_to = self.doc.get_attribute(root, "InResponseTo").unwrap_or("");
+        let in_response_to = in_response_to.unwrap_or("");
         debug!(
             "[validate] ArtifactResponse InResponseTo='{in_response_to}' (expected='{expected}')"
         );
@@ -160,10 +143,12 @@ impl Validator<'_, '_> {
     // Response is reported on the success path regardless of other errors, so the
     // caller never treats "signature fine, status Success" as a usable response;
     // more than one Response is ambiguous and rejected rather than picking one.
-    fn extract_response(&mut self, art_node: NodeId, status_code: Option<&str>) -> Option<NodeId> {
-        // Extract the inner Response from the PARSED tree (comment-safe,
-        // anti-XSW; see `child_element`).
-        let response = child_element(self.doc, art_node, NS_SAMLP, "Response");
+    fn extract_response<'r>(
+        &mut self,
+        responses: &'r [Response],
+        status_code: Option<&str>,
+    ) -> Option<&'r Response> {
+        let response = responses.first();
         debug!(
             "[validate] Extracted inner Response: present={}",
             response.is_some()
@@ -175,10 +160,10 @@ impl Validator<'_, '_> {
                     .to_string(),
             );
         }
-        let response_count = children_by_tag(self.doc, art_node, NS_SAMLP, "Response").len();
-        if response_count > 1 {
+        if responses.len() > 1 {
             self.error(format!(
-                "ArtifactResponse carries {response_count} Response elements (at most one is allowed)"
+                "ArtifactResponse carries {} Response elements (at most one is allowed)",
+                responses.len()
             ));
         }
         response

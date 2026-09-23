@@ -4,7 +4,8 @@ use super::helpers::Validator;
 use crate::{
     saml::{
         constants::{NS_SAMLP, STATUS_SUCCESS},
-        xml_parser::{self, QName, find_descendant},
+        model::LogoutResponse,
+        xml::Document,
     },
     types::{EndpointUrl, EntityId, MessageId},
 };
@@ -29,22 +30,18 @@ pub fn validate_logout_response(
     rd_entity_id: &EntityId,
     sls_url: &EndpointUrl,
 ) -> Result<LogoutResponseFields, String> {
-    let doc = xml_parser::parse(saml_response)
-        .map_err(|e| format!("could not parse LogoutResponse XML: {e}"))?;
-    let root = doc.document_element();
+    let parse_error = |e| format!("could not parse LogoutResponse XML: {e}");
+    let doc = Document::parse(saml_response).map_err(parse_error)?;
 
     // Matched by (namespace, local name): a same-local-name element in another
     // namespace is not a samlp:LogoutResponse.
-    let expected_root = QName {
-        namespace: Some(NS_SAMLP),
-        local_name: "LogoutResponse",
-    };
-    if doc.node_qname(root) != Some(expected_root) {
+    if !doc.root().is(NS_SAMLP, "LogoutResponse") {
         return Err("response root is not samlp:LogoutResponse".to_string());
     }
-    check_logout_response(&doc, root, rd_entity_id, sls_url)?;
+    let response: LogoutResponse = doc.deserialize().map_err(parse_error)?;
+    check_logout_response(&doc, &response, rd_entity_id, sls_url)?;
 
-    let Some(in_response_to) = doc.get_attribute(root, "InResponseTo") else {
+    let Some(in_response_to) = response.in_response_to.as_deref() else {
         return Err("LogoutResponse has no InResponseTo".to_string());
     };
     // It is about to be looked up in the pending-request store, so require the
@@ -52,9 +49,7 @@ pub fn validate_logout_response(
     let in_response_to = MessageId::parse(in_response_to)
         .map_err(|e| format!("LogoutResponse InResponseTo is not a message ID: {e}"))?;
 
-    let status_is_success = find_descendant(&doc, root, NS_SAMLP, "StatusCode")
-        .and_then(|n| doc.get_attribute(n, "Value"))
-        == Some(STATUS_SUCCESS);
+    let status_is_success = response.status.as_ref().and_then(|s| s.code()) == Some(STATUS_SUCCESS);
 
     Ok(LogoutResponseFields {
         in_response_to,
@@ -65,28 +60,32 @@ pub fn validate_logout_response(
 /// The §7.7.2 mandatory-field checks: `@Version`, `@IssueInstant` freshness,
 /// `Issuer` = the RD, and `@Destination` = our SLS endpoint.
 fn check_logout_response(
-    doc: &xml_parser::Document,
-    root: xml_parser::NodeId,
+    doc: &Document,
+    response: &LogoutResponse,
     rd_entity_id: &EntityId,
     sls_url: &EndpointUrl,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     let mut v = Validator::new(doc, &mut errors);
     // eID §7.7.2 (cardinality 1): @Version MUST be 2.0.
-    v.check_version(root, "LogoutResponse");
+    v.check_version(response.version.as_deref(), "LogoutResponse");
     // eID §7.7.2 (cardinality 1): @IssueInstant MUST be present. A LogoutResponse
     // carries no Conditions, so bound it the same way the other envelopes are
     // bounded, otherwise a captured response stays structurally valid forever
     // (the InResponseTo consume-once check is the only other replay bound).
     v.check_freshness(
-        doc.get_attribute(root, "IssueInstant"),
+        response.issue_instant.as_deref(),
         "LogoutResponse @IssueInstant",
     );
     // Bind to the RD, mirroring the ACS path.
-    v.check_issuer(root, Some(rd_entity_id), "LogoutResponse");
+    v.check_issuer(
+        response.issuer.as_deref(),
+        Some(rd_entity_id),
+        "LogoutResponse",
+    );
     // eID §7.7.2 (cardinality 1): @Destination MUST be present and MUST be our
     // SLS endpoint, so a response minted for another SP is not accepted here.
-    match doc.get_attribute(root, "Destination") {
+    match response.destination.as_deref() {
         Some(d) if d == sls_url.as_str() => {}
         Some(_) => v.error("LogoutResponse @Destination is not our SLS endpoint".to_string()),
         None => v.error("LogoutResponse is missing the required @Destination".to_string()),

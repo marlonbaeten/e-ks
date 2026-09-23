@@ -6,15 +6,13 @@ use crate::{
     saml::{
         constants::{
             EID_ACTING_SUBJECT_ID, EID_ID_TYPES, EID_LEGAL_SUBJECT_ID, EID_SERVICE_UUID,
-            NAMEID_PERSISTENT, NAMEID_TRANSIENT, NS_SAML, SUBJECT_CONFIRMATION_BEARER,
+            NAMEID_PERSISTENT, NAMEID_TRANSIENT, SUBJECT_CONFIRMATION_BEARER,
         },
         decryption::{DecryptedNameId, decrypt_encrypted_id},
         loa::LevelOfAssurance,
+        model::{self, Assertion, Attribute, SubjectConfirmation, SubjectConfirmationData},
         subject::SubjectId,
-        xml_parser::{
-            Document, NodeId, children_by_tag, descendants_by_tag_pruned, direct_text, find_child,
-            find_descendant, find_descendant_pruned,
-        },
+        xml::Document,
     },
     types::{EndpointUrl, EntityId, MessageId, NameId, ServiceUuid},
 };
@@ -62,8 +60,8 @@ pub struct ValidateAssertionOpts<'a> {
     pub expected_service_uuid: Option<&'a ServiceUuid>,
 }
 
-/// Validate the Assertion element `root` within the already-parsed document `doc`
-/// per eID §7.6.3 and processing rules §7.6.3.5, and extract [`Claims`].
+/// Validate `assertion`, read from the already-parsed document `doc`, per eID
+/// §7.6.3 and processing rules §7.6.3.5, and extract [`Claims`].
 ///
 /// Mirrors the envelope validators: failures are pushed onto `errors` and the
 /// extracted value is returned, `Some` only when no error was recorded.
@@ -72,8 +70,8 @@ pub struct ValidateAssertionOpts<'a> {
 /// (verified in [`validate_artifact_response_at`]); per eID §9.1, signatures inside
 /// an Assertion/Advice are evidence-only and not separately validated (matching
 /// the TVS reference impl `minvws/nl-rdo-max`). The `<saml:Advice>` evidence
-/// subtree is skipped during claim lookups (via `find_claim`/`find_claims`) so
-/// claims come only from the outer RD Assertion.
+/// subtree is not part of the [`Assertion`] model at all, so claims come only
+/// from the outer RD Assertion.
 ///
 /// Processing rules implemented (eID §7.6.3.5):
 ///  1. Issuer is the expected RD EntityID (rule 1, binding)
@@ -90,25 +88,29 @@ pub struct ValidateAssertionOpts<'a> {
 /// [`validate_artifact_response_at`]: super::validate_artifact_response_at
 pub fn validate_assertion_at(
     doc: &Document,
-    root: NodeId,
+    assertion: &Assertion,
     opts: &ValidateAssertionOpts<'_>,
     errors: &mut Vec<String>,
 ) -> Option<Claims> {
     let base_error_count = errors.len();
     let mut v = Validator::new(doc, errors);
 
-    v.check_version(root, "Assertion");
+    v.check_version(assertion.version.as_deref(), "Assertion");
     // §7.6.3.5 rule 1 (binding): the Assertion Issuer MUST be the RD (TVS)
     // EntityID, ensuring the RD-signed payload originates from the RD.
-    v.check_issuer(root, opts.expected_issuer, "Assertion");
-    v.check_subject_confirmation(root, opts);
-    v.check_conditions(root);
-    v.check_audience_restriction(root, opts.dv_entity_id);
-    v.check_assertion_instants(root);
+    v.check_issuer(
+        assertion.issuer.as_deref(),
+        opts.expected_issuer,
+        "Assertion",
+    );
+    v.check_subject_confirmation(assertion, opts);
+    v.check_conditions(assertion);
+    v.check_audience_restriction(assertion, opts.dv_entity_id);
+    v.check_assertion_instants(assertion);
 
     // Extraction records its own errors (NameID format, LoA, ServiceUUID,
     // decrypted-ID shape), so it runs before the validity verdict.
-    let claims = v.extract_claims(root, opts);
+    let claims = v.extract_claims(assertion, opts);
 
     let valid = errors.len() == base_error_count;
     debug!(
@@ -124,59 +126,49 @@ pub fn validate_assertion_at(
     claims
 }
 
+fn subject_confirmation(assertion: &Assertion) -> Option<&SubjectConfirmation> {
+    assertion.subject.as_ref()?.subject_confirmation.as_ref()
+}
+
+/// The `<saml:Attribute>`s of the Assertion's `<AttributeStatement>`s (eID
+/// §7.6.3.4), in document order. An `<Attribute>` anywhere else (say an
+/// extension point of `<Conditions>`) is not in the model, so never a claim.
+fn attributes(assertion: &Assertion) -> impl Iterator<Item = &Attribute> {
+    assertion
+        .attribute_statements
+        .iter()
+        .flat_map(|s| &s.attributes)
+}
+
 /// The assertion-level checks and claim extraction (eID §7.6.3), as methods on
 /// the shared [`Validator`] context.
 impl Validator<'_, '_> {
-    /// Find a descendant `(NS_SAML, local)` within an Assertion, skipping the
-    /// `<saml:Advice>` evidence subtree (the AD assertions, eID §7.6.3) so claims
-    /// are read only from the outer RD Assertion.
-    fn find_claim(&self, assertion: NodeId, local: &str) -> Option<NodeId> {
-        find_descendant_pruned(self.doc, assertion, (NS_SAML, local), (NS_SAML, "Advice"))
-    }
-
-    /// All descendants `(NS_SAML, local)` within an Assertion, skipping `<saml:Advice>`.
-    fn find_claims(&self, assertion: NodeId, local: &str) -> Vec<NodeId> {
-        descendants_by_tag_pruned(self.doc, assertion, (NS_SAML, local), (NS_SAML, "Advice"))
-    }
-
-    /// The `<saml:Attribute>` elements of the Assertion's `<AttributeStatement>`s
-    /// (eID §7.6.3.4), in document order.
-    ///
-    /// SECURITY: scoped to `<AttributeStatement>` (whose direct children the SAML
-    /// schema says these are), not to any `<Attribute>` anywhere under the
-    /// Assertion. Combined with the `<Advice>` pruning in [`Self::find_claims`],
-    /// an `<Attribute>` planted elsewhere in the outer Assertion (say inside a
-    /// `<Conditions>` or `<AuthnStatement>` extension point) is never read as a
-    /// claim.
-    fn find_attributes(&self, assertion: NodeId) -> Vec<NodeId> {
-        self.find_claims(assertion, "AttributeStatement")
-            .into_iter()
-            .flat_map(|stmt| children_by_tag(self.doc, stmt, NS_SAML, "Attribute"))
-            .collect()
-    }
-
     /// Extract the [`Claims`], recording any extraction-level errors (NameID
     /// format, LoA, ServiceUUID, decrypted-ID shape). Returns `None` only when
     /// the mandatory Subject NameID is absent, which
     /// `check_subject_name_id_format` has then already recorded as an error.
-    fn extract_claims(&mut self, root: NodeId, opts: &ValidateAssertionOpts<'_>) -> Option<Claims> {
-        let name_id = self.checked_subject_name_id(root);
+    fn extract_claims(
+        &mut self,
+        assertion: &Assertion,
+        opts: &ValidateAssertionOpts<'_>,
+    ) -> Option<Claims> {
+        let name_id = self.checked_subject_name_id(assertion);
 
         let (authn_context_class_ref, authenticating_authority) =
-            self.check_authn_context(root, opts.minimum_loa);
+            self.check_authn_context(assertion, opts.minimum_loa);
 
-        let (acting_subject_id, legal_subject_id) = self.extract_encrypted_subject_ids(root, opts);
+        let (acting_subject_id, legal_subject_id) =
+            self.extract_encrypted_subject_ids(assertion, opts);
 
         // Extract InResponseTo from SubjectConfirmationData for replay protection
         // (eID §9.7). A value that is not a well-formed message ID names no
         // AuthnRequest this DV could have issued, so it is dropped here and the
         // caller's rule-4 check then fails closed on the absent value.
-        let in_response_to = self
-            .find_claim(root, "SubjectConfirmationData")
-            .and_then(|scd| self.doc.get_attribute(scd, "InResponseTo"))
+        let in_response_to = subject_confirmation(assertion)
+            .and_then(|sc| sc.data.as_ref()?.in_response_to.as_deref())
             .and_then(|id| MessageId::parse(id).ok());
 
-        let service_uuid = self.check_service_uuid(root, opts.expected_service_uuid);
+        let service_uuid = self.check_service_uuid(assertion, opts.expected_service_uuid);
         debug!(
             "[validate] in_response_to_present={}, service_uuid_present={}, \
              acting_subject_present={}, legal_subject_present={}",
@@ -202,19 +194,12 @@ impl Validator<'_, '_> {
     /// eID §7.6.3: the Subject NameID (a TransientID) is read from the outer
     /// assertion's `<Subject>`, not from a SubjectConfirmation or the Advice
     /// subtree.
-    fn checked_subject_name_id(&mut self, root: NodeId) -> Option<NameId> {
-        let name_id_node = self
-            .find_claim(root, "Subject")
-            .and_then(|s| find_child(self.doc, s, NS_SAML, "NameID"));
-        // `direct_text`: the identifier is the NameID's own text.
-        let text = name_id_node.and_then(|n| direct_text(self.doc, n));
-        if name_id_node.is_some() && text.is_none() {
-            self.error("Subject NameID contains child elements".to_string());
-        }
-        self.check_subject_name_id_format(name_id_node);
+    fn checked_subject_name_id(&mut self, assertion: &Assertion) -> Option<NameId> {
+        let name_id = assertion.subject.as_ref().and_then(|s| s.name_id.as_ref());
+        self.check_subject_name_id_format(name_id);
         // The NameID is echoed back to the RD in the later LogoutRequest, so an
         // empty or otherwise unusable one is rejected here rather than carried.
-        let name_id = match text.as_deref().map(NameId::parse) {
+        let name_id = match name_id.map(|n| NameId::parse(&n.value)) {
             Some(Ok(name_id)) => Some(name_id),
             Some(Err(e)) => {
                 self.error(format!("Subject NameID is not usable: {e}"));
@@ -228,16 +213,16 @@ impl Validator<'_, '_> {
 
     // Bound how stale this Assertion and its authentication act may be. Both
     // instants are mandatory (eID §7.6.3, cardinality 1), so absence is an error.
-    fn check_assertion_instants(&mut self, root: NodeId) {
+    fn check_assertion_instants(&mut self, assertion: &Assertion) {
         self.check_freshness(
-            self.doc.get_attribute(root, "IssueInstant"),
+            assertion.issue_instant.as_deref(),
             "Assertion @IssueInstant",
         );
         // eID §7.6.3 (cardinality 1): the AuthnStatement itself is mandatory; a
         // missing one is reported as such rather than only via its @AuthnInstant.
-        match self.find_claim(root, "AuthnStatement") {
+        match &assertion.authn_statement {
             Some(stmt) => self.check_freshness(
-                self.doc.get_attribute(stmt, "AuthnInstant"),
+                stmt.authn_instant.as_deref(),
                 "AuthnStatement @AuthnInstant",
             ),
             None => self.error("Assertion is missing the required AuthnStatement".to_string()),
@@ -250,17 +235,13 @@ impl Validator<'_, '_> {
     // check (tests).
     fn check_service_uuid(
         &mut self,
-        root: NodeId,
+        assertion: &Assertion,
         expected: Option<&ServiceUuid>,
     ) -> Option<String> {
-        let service_uuid = self
-            .find_attributes(root)
-            .iter()
-            .find(|&&a| self.doc.get_attribute(a, "Name") == Some(EID_SERVICE_UUID))
-            .and_then(|&a| find_descendant(self.doc, a, NS_SAML, "AttributeValue"))
-            // `direct_text`: the ServiceUUID is the AttributeValue's own text.
-            // Trimmed at extraction so the returned claim matches what we compare.
-            .and_then(|av| direct_text(self.doc, av))
+        // Trimmed at extraction so the returned claim matches what we compare.
+        let service_uuid = attributes(assertion)
+            .find(|a| a.name.as_deref() == Some(EID_SERVICE_UUID))
+            .and_then(|a| a.values.first()?.text.as_deref())
             .map(|u| u.trim().to_string());
 
         if let Some(expected) = expected {
@@ -276,8 +257,8 @@ impl Validator<'_, '_> {
     }
 
     // eID §7.6.3: the Subject <NameID> MUST be present and be a TransientID.
-    fn check_subject_name_id_format(&mut self, name_id_node: Option<NodeId>) {
-        let Some(n) = name_id_node else {
+    fn check_subject_name_id_format(&mut self, name_id: Option<&model::NameId>) {
+        let Some(name_id) = name_id else {
             // eID §7.6.3 (cardinality 1): the Subject NameID is mandatory. Fail
             // closed so `Claims.name_id` is guaranteed present on success.
             self.error("Assertion is missing the required Subject NameID".to_string());
@@ -287,7 +268,7 @@ impl Validator<'_, '_> {
         // TVS preprod IdP omits it on the Subject NameID; tolerate absence (the
         // acting identity comes from the decrypted EncryptedID, not this NameID)
         // but still reject a present-but-non-transient Format.
-        match self.doc.get_attribute(n, "Format") {
+        match name_id.format.as_deref() {
             None | Some(NAMEID_TRANSIENT) => {}
             Some(format) => self.error(format!(
                 "Subject NameID Format must be {NAMEID_TRANSIENT} (a TransientID), got '{format}'"
@@ -296,8 +277,12 @@ impl Validator<'_, '_> {
     }
 
     // eID §7.6.3.3: SubjectConfirmation validation (method, recipient, expiry).
-    fn check_subject_confirmation(&mut self, root: NodeId, opts: &ValidateAssertionOpts<'_>) {
-        let Some(sc) = self.find_claim(root, "SubjectConfirmation") else {
+    fn check_subject_confirmation(
+        &mut self,
+        assertion: &Assertion,
+        opts: &ValidateAssertionOpts<'_>,
+    ) {
+        let Some(sc) = subject_confirmation(assertion) else {
             // eID §7.6.3 (cardinality 1) / §7.6.3.5 rules 2-3: SubjectConfirmation
             // is mandatory and carries the Recipient/expiry/InResponseTo bindings,
             // so its absence fails closed rather than skipping those checks.
@@ -306,13 +291,13 @@ impl Validator<'_, '_> {
             return;
         };
         // §7.6.3.3: Method MUST be bearer.
-        let method = self.doc.get_attribute(sc, "Method").unwrap_or("");
+        let method = sc.method.as_deref().unwrap_or("");
         debug!("[validate] SubjectConfirmation Method='{method}'");
         if method != SUBJECT_CONFIRMATION_BEARER {
             self.error(format!("Expected bearer SubjectConfirmation, got {method}"));
         }
 
-        let Some(scd) = find_child(self.doc, sc, NS_SAML, "SubjectConfirmationData") else {
+        let Some(scd) = &sc.data else {
             // eID §7.6.3.3 (cardinality 1): mandatory; without it there is no
             // Recipient / NotOnOrAfter / InResponseTo to validate, so fail closed.
             self.error(
@@ -334,25 +319,22 @@ impl Validator<'_, '_> {
     // Recipient bindings.
     fn check_subject_confirmation_data(
         &mut self,
-        scd: NodeId,
+        scd: &SubjectConfirmationData,
         expected_recipient: Option<&EndpointUrl>,
     ) {
         // §7.6.3.5 rule 3: Verify NotOnOrAfter has not passed.
         // §7.6.3.3: Initially set to +2 minutes; @NotBefore MUST NOT be used.
         debug!(
             "[validate] Rule 3: SubjectConfirmation NotOnOrAfter={:?}",
-            self.doc.get_attribute(scd, "NotOnOrAfter")
+            scd.not_on_or_after
         );
-        self.check_not_on_or_after(
-            self.doc.get_attribute(scd, "NotOnOrAfter"),
-            "SubjectConfirmation",
-        );
+        self.check_not_on_or_after(scd.not_on_or_after.as_deref(), "SubjectConfirmation");
 
         // eID §7.6.3.3 (and SAML core §2.4.1.2 for bearer): @NotBefore MUST NOT
         // be used on SubjectConfirmationData. Its presence means the sender is
         // not following the profile we validate against, so fail closed rather
         // than ignore an attribute that would widen the bearer window.
-        if let Some(nb) = self.doc.get_attribute(scd, "NotBefore") {
+        if let Some(nb) = &scd.not_before {
             self.error(format!(
                 "SubjectConfirmationData carries @NotBefore ({nb}), which eID §7.6.3.3 forbids"
             ));
@@ -362,7 +344,7 @@ impl Validator<'_, '_> {
         let Some(expected_recipient) = expected_recipient else {
             return;
         };
-        let recipient = self.doc.get_attribute(scd, "Recipient").unwrap_or("");
+        let recipient = scd.recipient.as_deref().unwrap_or("");
         debug!("[validate] Rule 2: Recipient='{recipient}' (expected='{expected_recipient}')");
         if recipient != expected_recipient.as_str() {
             self.error(format!(
@@ -372,8 +354,8 @@ impl Validator<'_, '_> {
     }
 
     // eID §7.6.3 / §9.5: Conditions NotBefore and NotOnOrAfter window.
-    fn check_conditions(&mut self, root: NodeId) {
-        let Some(cond) = self.find_claim(root, "Conditions") else {
+    fn check_conditions(&mut self, assertion: &Assertion) {
+        let Some(cond) = &assertion.conditions else {
             // eID §7.6.3 (cardinality 1) / §9.5: Conditions with its NotBefore /
             // NotOnOrAfter validity window is mandatory; fail closed on its
             // absence rather than treating the assertion as unconditionally
@@ -384,35 +366,31 @@ impl Validator<'_, '_> {
         };
         debug!(
             "[validate] Rule 6: Conditions NotBefore={:?}, NotOnOrAfter={:?}",
-            self.doc.get_attribute(cond, "NotBefore"),
-            self.doc.get_attribute(cond, "NotOnOrAfter"),
+            cond.not_before, cond.not_on_or_after,
         );
-        self.check_not_before(
-            self.doc.get_attribute(cond, "NotBefore"),
-            "Assertion Conditions",
-        );
-        self.check_not_on_or_after(self.doc.get_attribute(cond, "NotOnOrAfter"), "Assertion");
+        self.check_not_before(cond.not_before.as_deref(), "Assertion Conditions");
+        self.check_not_on_or_after(cond.not_on_or_after.as_deref(), "Assertion");
     }
 
     // §7.6.3.5 rule 5: Verify DV EntityID is in AudienceRestriction.
     // eID §7.6.3.1: Assertion may only be processed if AudienceRestriction
     // contains the DV EntityID.
-    fn check_audience_restriction(&mut self, root: NodeId, dv_entity_id: &EntityId) {
-        // `direct_text`: an entry with element children is not an audience, so it
-        // is skipped and cannot match. Trimmed because an <Audience> holds one
-        // EntityID token and the RD pretty-prints around it.
-        let audiences: Vec<String> = self
-            .find_claims(root, "Audience")
+    fn check_audience_restriction(&mut self, assertion: &Assertion, dv_entity_id: &EntityId) {
+        // Trimmed because an <Audience> holds one EntityID token and the RD
+        // pretty-prints around it.
+        let audiences: Vec<&str> = assertion
+            .conditions
             .iter()
-            .filter_map(|&n| direct_text(self.doc, n))
-            .map(|a| a.trim().to_string())
+            .flat_map(|c| &c.audience_restrictions)
+            .flat_map(|r| &r.audiences)
+            .map(|a| a.trim())
             .collect();
         debug!(
             "[validate] Rule 5: AudienceRestriction has {} audience(s); expected '{}'",
             audiences.len(),
             dv_entity_id
         );
-        if !audiences.iter().any(|a| a == dv_entity_id.as_str()) {
+        if !audiences.contains(&dv_entity_id.as_str()) {
             self.error(format!(
                 "DV entityId {} not in AudienceRestriction: [{}]",
                 dv_entity_id,
@@ -427,21 +405,21 @@ impl Validator<'_, '_> {
     // https://tvs.dictu.nl/sites/default/files/documents/Checklist-Testen-TVS-2.1.pdf
     fn check_authn_context(
         &mut self,
-        root: NodeId,
+        assertion: &Assertion,
         minimum_loa: Option<LevelOfAssurance>,
     ) -> (Option<String>, Option<String>) {
-        // `direct_text`: the LoA URI decides whether this authentication is strong
-        // enough. Element children yield `None`, rejected below as a missing
-        // AuthnContextClassRef. Both are a single URI token and the RD
-        // pretty-prints around them; the §10.3 lookup below is an exact match, so
-        // an untrimmed value reads as an unrecognised LoA.
-        let authn_context_class_ref = self
-            .find_claim(root, "AuthnContextClassRef")
-            .and_then(|n| direct_text(self.doc, n))
+        // Both are a single URI token and the RD pretty-prints around them; the
+        // §10.3 lookup below is an exact match, so an untrimmed value reads as an
+        // unrecognised LoA.
+        let authn_context = assertion
+            .authn_statement
+            .as_ref()
+            .and_then(|s| s.authn_context.as_ref());
+        let authn_context_class_ref = authn_context
+            .and_then(|c| c.class_ref.as_deref())
             .map(|t| t.trim().to_string());
-        let authenticating_authority = self
-            .find_claim(root, "AuthenticatingAuthority")
-            .and_then(|n| direct_text(self.doc, n))
+        let authenticating_authority = authn_context
+            .and_then(|c| c.authenticating_authorities.first())
             .map(|t| t.trim().to_string());
         debug!(
             "[validate] AuthnContextClassRef={:?}, AuthenticatingAuthority={:?}",
@@ -477,19 +455,18 @@ impl Validator<'_, '_> {
     // eID §7.6.3.4.4: Identifiers in EncryptedID, decrypted with DV's private key.
     fn extract_encrypted_subject_ids(
         &mut self,
-        root: NodeId,
+        assertion: &Assertion,
         opts: &ValidateAssertionOpts<'_>,
     ) -> (Option<SubjectId>, Option<SubjectId>) {
         let mut acting_subject_id: Option<SubjectId> = None;
         let mut legal_subject_id: Option<SubjectId> = None;
-        let attributes = self.find_attributes(root);
         debug!(
             "[validate] AttributeStatement contains {} Attribute element(s)",
-            attributes.len()
+            attributes(assertion).count()
         );
 
-        for attr_el in attributes {
-            let name = self.doc.get_attribute(attr_el, "Name").unwrap_or("");
+        for attr in attributes(assertion) {
+            let name = attr.name.as_deref().unwrap_or("");
             // Only the encrypted subject-ID attributes carry an EncryptedID we decrypt.
             let is_acting = match name {
                 // eID §7.6.3.4: ActingSubjectID MUST be present.
@@ -498,7 +475,7 @@ impl Validator<'_, '_> {
                 EID_LEGAL_SUBJECT_ID => false,
                 _ => continue,
             };
-            let Some(enc_id) = find_descendant(self.doc, attr_el, NS_SAML, "EncryptedID") else {
+            let Some(enc_id) = attr.values.iter().find_map(|v| v.encrypted_id.as_ref()) else {
                 continue;
             };
 
@@ -534,7 +511,6 @@ impl Validator<'_, '_> {
 
         (acting_subject_id, legal_subject_id)
     }
-
     // eID §7.6.3.4.4: a decrypted EncryptedID NameID MUST use the persistent
     // Format, MUST carry a NameQualifier identifying the attribute type, and
     // MUST NOT use SPNameQualifier or SPProvidedID.
@@ -575,29 +551,31 @@ impl Validator<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saml::xml_parser::{inner_text, parse};
+    use crate::saml::constants::NS_SAML;
 
-    // -- Advice pruning --
+    fn parse_assertion(xml: &str) -> (Document<'_>, Assertion) {
+        let doc = Document::parse(xml).expect("test Assertion parses");
+        let assertion = doc.deserialize().expect("test Assertion deserializes");
+        (doc, assertion)
+    }
+
+    // -- Advice --
 
     #[test]
     fn claims_are_read_from_outer_assertion_not_advice() {
         // The outer RD Assertion carries the real Issuer; the <Advice> evidence
-        // subtree holds the AD's own assertion with a different Issuer. Claim
-        // lookups must read only the outer Assertion.
+        // subtree holds the AD's own assertion with a different Issuer and LoA.
+        // Claims must come from the outer Assertion only.
         let xml = format!(
             r#"<saml:Assertion xmlns:saml="{NS_SAML}"><saml:Issuer>OUTER_RD</saml:Issuer><saml:Advice><saml:Assertion><saml:Issuer>INNER_AD</saml:Issuer><saml:AuthnStatement><saml:AuthnContext><saml:AuthnContextClassRef>INNER_LOA</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement></saml:Assertion></saml:Advice></saml:Assertion>"#
         );
-        let doc = parse(&xml).unwrap();
-        let root = doc.document_element();
-        // Issuer is a direct child of the outer Assertion.
-        assert_eq!(
-            find_child(&doc, root, NS_SAML, "Issuer").and_then(|n| inner_text(&doc, n)),
-            Some("OUTER_RD".to_string())
-        );
-        // The AD's AuthnContextClassRef inside <Advice> is invisible to find_claim.
+        let (doc, assertion) = parse_assertion(&xml);
+        assert_eq!(assertion.issuer.as_deref(), Some("OUTER_RD"));
+        // The AD's AuthnContextClassRef inside <Advice> is invisible.
         let mut errors = Vec::new();
-        let v = Validator::new(&doc, &mut errors);
-        assert!(v.find_claim(root, "AuthnContextClassRef").is_none());
+        let (class_ref, _) =
+            Validator::new(&doc, &mut errors).check_authn_context(&assertion, None);
+        assert!(class_ref.is_none());
     }
 
     // -- check_decrypted_name_id (eID §7.6.3.4.4) --
@@ -615,7 +593,7 @@ mod tests {
     /// Run `check_decrypted_name_id` over a dummy document (it never reads the
     /// tree) and return the recorded errors.
     fn decrypted_name_id_errors(d: &DecryptedNameId) -> Vec<String> {
-        let doc = parse(r#"<x xmlns="urn:x"/>"#).unwrap();
+        let doc = Document::parse(r#"<x xmlns="urn:x"/>"#).unwrap();
         let mut errors = Vec::new();
         Validator::new(&doc, &mut errors).check_decrypted_name_id(EID_ACTING_SUBJECT_ID, d);
         errors
@@ -674,13 +652,12 @@ mod tests {
         let xml = format!(
             r#"<saml:Assertion xmlns:saml="{NS_SAML}"><saml:Attribute Name="{EID_SERVICE_UUID}"><saml:AttributeValue>planted</saml:AttributeValue></saml:Attribute></saml:Assertion>"#
         );
-        let doc = parse(&xml).unwrap();
-        let root = doc.document_element();
+        let (doc, assertion) = parse_assertion(&xml);
+        assert_eq!(attributes(&assertion).count(), 0);
         let mut errors = Vec::new();
         let mut v = Validator::new(&doc, &mut errors);
-        assert!(v.find_attributes(root).is_empty());
         let planted = ServiceUuid::from_static("planted");
-        assert_eq!(v.check_service_uuid(root, Some(&planted)), None);
+        assert_eq!(v.check_service_uuid(&assertion, Some(&planted)), None);
         assert!(
             errors.iter().any(|e| e.contains("missing the required")),
             "{errors:?}"
@@ -709,12 +686,11 @@ mod tests {
         let xml = format!(
             r#"<saml:Assertion xmlns:saml="{NS_SAML}"><saml:AttributeStatement><saml:Attribute Name="{EID_SERVICE_UUID}"><saml:AttributeValue>actual-service</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>"#
         );
-        let doc = parse(&xml).unwrap();
-        let root = doc.document_element();
+        let (doc, assertion) = parse_assertion(&xml);
         let mut errors = Vec::new();
         let claims = validate_assertion_at(
             &doc,
-            root,
+            &assertion,
             &ValidateAssertionOpts {
                 dv_entity_id: &EntityId::from_static("urn:dv"),
                 expected_recipient: None,

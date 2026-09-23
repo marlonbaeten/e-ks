@@ -8,11 +8,10 @@ use crate::{
     error::{AuthError, Result},
     keys::{CertificateBase64, CertificatePem, KeyPair, PrivateKeyPem},
     saml::{
-        constants::{BINDING_HTTP_POST, BINDING_SOAP, CLOCK_SKEW_SECONDS, NS_DSIG, NS_MD},
+        constants::{BINDING_HTTP_POST, BINDING_SOAP, CLOCK_SKEW_SECONDS, NS_MD},
+        model::{Endpoint, EntityDescriptor, IdpSsoDescriptor, KeyDescriptor},
         verification::{ExpectedRoot, verify_xml_signature},
-        xml_parser::{
-            Document, NodeId, descendants_by_tag, direct_text, find_child, find_descendant,
-        },
+        xml::Document,
     },
     types::{EndpointUrl, EntityId},
 };
@@ -80,15 +79,15 @@ pub struct IdpKeys {
 ///
 /// Only keys with an `X509Certificate` are extracted; KeyName-only descriptors
 /// are skipped (they require an out-of-band certificate lookup).
-pub fn extract_idp_keys(doc: &Document, root: NodeId) -> IdpKeys {
+pub fn extract_idp_keys(idp: &IdpSsoDescriptor) -> IdpKeys {
     let mut signing = Vec::new();
     let mut encryption = Vec::new();
 
-    for kd in descendants_by_tag(doc, root, NS_MD, "KeyDescriptor") {
-        let Some(kp) = descriptor_key_pair(doc, kd) else {
+    for kd in &idp.key_descriptors {
+        let Some(kp) = descriptor_key_pair(kd) else {
             continue;
         };
-        match doc.get_attribute(kd, "use") {
+        match kd.key_use.as_deref() {
             Some("signing") => signing.push(kp),
             Some("encryption") => encryption.push(kp),
             _ => {
@@ -107,10 +106,9 @@ pub fn extract_idp_keys(doc: &Document, root: NodeId) -> IdpKeys {
 
 /// The public-only [`KeyPair`] of a `KeyDescriptor`'s `X509Certificate`, or
 /// `None` for a KeyName-only descriptor.
-fn descriptor_key_pair(doc: &Document, kd: NodeId) -> Option<KeyPair> {
-    let cert_node = find_descendant(doc, kd, NS_DSIG, "X509Certificate")?;
-    // `direct_text`: a trusted signing cert is the element's own text.
-    let cert_base64 = match CertificateBase64::parse(&direct_text(doc, cert_node)?) {
+fn descriptor_key_pair(kd: &KeyDescriptor) -> Option<KeyPair> {
+    let cert = kd.key_info.as_ref()?.certificate()?;
+    let cert_base64 = match CertificateBase64::parse(cert) {
         Ok(cert) => cert,
         Err(e) => {
             warn!("[metadata] Skipping malformed KeyDescriptor certificate: {e}");
@@ -125,34 +123,26 @@ fn descriptor_key_pair(doc: &Document, kd: NodeId) -> Option<KeyPair> {
 
 /// The RD's `<md:IDPSSODescriptor>`: the one role descriptor every endpoint and
 /// `KeyDescriptor` below is read from.
-fn idp_sso_descriptor(doc: &Document, root: NodeId) -> Result<NodeId> {
-    find_child(doc, root, NS_MD, "IDPSSODescriptor").ok_or_else(|| {
+fn idp_sso_descriptor(ed: &EntityDescriptor) -> Result<&IdpSsoDescriptor> {
+    ed.idp_sso_descriptor.as_ref().ok_or_else(|| {
         AuthError::Config("metadata: EntityDescriptor has no IDPSSODescriptor".into())
     })
 }
 
-fn endpoint_location(doc: &Document, root: NodeId, tag: &str, binding: &str) -> Option<String> {
-    descendants_by_tag(doc, root, NS_MD, tag)
-        .into_iter()
-        .find_map(|n| {
-            (doc.get_attribute(n, "Binding") == Some(binding))
-                .then(|| doc.get_attribute(n, "Location").map(str::to_owned))
-                .flatten()
-        })
+fn endpoint_location<'e>(endpoints: &'e [Endpoint], binding: &str) -> Option<&'e str> {
+    endpoints
+        .iter()
+        .filter(|e| e.binding.as_deref() == Some(binding))
+        .find_map(|e| e.location.as_deref())
 }
 
 /// The `Location` of the `tag` endpoint with `binding`, as a validated
 /// [`EndpointUrl`] (eID §9.4 requires https; see
 /// [`EndpointUrl::from_metadata`]).
-fn required_endpoint(
-    doc: &Document,
-    root: NodeId,
-    tag: &str,
-    binding: &str,
-) -> Result<EndpointUrl> {
-    let location = endpoint_location(doc, root, tag, binding)
+fn required_endpoint(endpoints: &[Endpoint], tag: &str, binding: &str) -> Result<EndpointUrl> {
+    let location = endpoint_location(endpoints, binding)
         .ok_or_else(|| AuthError::Config(format!("metadata: no {binding} {tag}")))?;
-    EndpointUrl::from_metadata(&location, tag)
+    EndpointUrl::from_metadata(location, tag)
 }
 
 /// Parse an XML Schema duration (e.g. `PT24H`, `P1D`, `PT1H30M`) into a
@@ -343,22 +333,19 @@ fn certificates(ders: &[Vec<u8>]) -> Vec<CertificateDer<'_>> {
 /// are not pinned individually (they rotate); trust comes from the chain + OIN.
 pub fn parse_idp_metadata(xml: &str, trust: &RdTrust) -> Result<IdpMetadata> {
     debug!("[metadata] Parsing IdP metadata (xml_len={})", xml.len());
-    let doc = crate::saml::xml_parser::parse(xml)?;
-    let root = doc.document_element();
+    let ed: EntityDescriptor = Document::parse(xml)?.deserialize()?;
 
-    let entity_id = pinned_entity_id(&doc, root, trust)?;
-    check_metadata_expiry(&doc, root)?;
+    let entity_id = pinned_entity_id(&ed, trust)?;
+    check_metadata_expiry(&ed)?;
     // Endpoints and keys are read only from the IdP role descriptor, never
     // document-wide (see `idp_sso_descriptor`).
-    let idp = idp_sso_descriptor(&doc, root)?;
-    let signing_keys = verified_signing_keys(xml, &doc, root, idp, trust)?;
+    let idp = idp_sso_descriptor(&ed)?;
+    let signing_keys = verified_signing_keys(xml, &ed, idp, trust)?;
 
-    let (sso_url, ars_url, slo_url) = resolve_endpoints(&doc, idp)?;
+    let (sso_url, ars_url, slo_url) = resolve_endpoints(idp)?;
     debug!("[metadata] Endpoints resolved: sso={sso_url}, ars={ars_url}, slo={slo_url}");
 
-    let cache_duration = doc
-        .get_attribute(root, "cacheDuration")
-        .and_then(parse_xs_duration);
+    let cache_duration = ed.cache_duration.as_deref().and_then(parse_xs_duration);
     debug!("[metadata] cacheDuration parsed as {cache_duration:?}");
 
     Ok(IdpMetadata {
@@ -373,9 +360,10 @@ pub fn parse_idp_metadata(xml: &str, trust: &RdTrust) -> Result<IdpMetadata> {
 
 /// eID §9.2 / §10.2: pin the RD identity. The expected EntityID is a configured
 /// constant, not a value taken from this (only self-signature-checked) document.
-fn pinned_entity_id(doc: &Document, root: NodeId, trust: &RdTrust) -> Result<EntityId> {
-    let entity_id = doc
-        .get_attribute(root, "entityID")
+fn pinned_entity_id(ed: &EntityDescriptor, trust: &RdTrust) -> Result<EntityId> {
+    let entity_id = ed
+        .entity_id
+        .as_deref()
         .ok_or_else(|| AuthError::Xml("metadata: missing entityID".into()))?;
     debug!("[metadata] entityID={entity_id}");
     let entity_id = EntityId::parse(entity_id)?;
@@ -392,14 +380,13 @@ fn pinned_entity_id(doc: &Document, root: NodeId, trust: &RdTrust) -> Result<Ent
 /// verifying the metadata's enveloping signature against exactly those certs.
 fn verified_signing_keys(
     xml: &str,
-    doc: &Document,
-    root: NodeId,
-    idp: NodeId,
+    ed: &EntityDescriptor,
+    idp: &IdpSsoDescriptor,
     trust: &RdTrust,
 ) -> Result<Vec<KeyPair>> {
     // Keys from the IdP role descriptor (`idp`); the signature covers, and is
-    // bound to, the whole `EntityDescriptor` (`root`).
-    let signing_keys = pinned_signing_keys(extract_idp_keys(doc, idp), trust)?;
+    // bound to, the whole `EntityDescriptor` (`ed`).
+    let signing_keys = pinned_signing_keys(extract_idp_keys(idp), trust)?;
     debug!("[metadata] Trusted signing keys: {}", signing_keys.len());
 
     // `xml` is the document the endpoints and keys came from, so the re-parse
@@ -407,7 +394,7 @@ fn verified_signing_keys(
     let expected_root = ExpectedRoot {
         namespace: NS_MD,
         local_name: "EntityDescriptor",
-        id: doc.get_attribute(root, "ID"),
+        id: ed.id.as_deref(),
     };
     let sig_result = verify_xml_signature(xml, &signing_keys, &expected_root);
     if !sig_result.is_valid() {
@@ -423,8 +410,8 @@ fn verified_signing_keys(
 /// eID §8.2/§8.5: do not use metadata past its hard expiry. If `validUntil` is
 /// present and has passed (subject to clock skew), reject the document so an
 /// expired descriptor, including a stale on-disk cache, is never trusted.
-fn check_metadata_expiry(doc: &Document, root: NodeId) -> Result<()> {
-    let valid_until = doc.get_attribute(root, "validUntil");
+fn check_metadata_expiry(ed: &EntityDescriptor) -> Result<()> {
+    let valid_until = ed.valid_until.as_deref();
     if let Some(s) = valid_until {
         // This runs before the metadata signature is verified, so `s` is
         // attacker-influenced whenever the HTTPS fetch (or the on-disk cache) is
@@ -449,7 +436,7 @@ fn check_metadata_expiry(doc: &Document, root: NodeId) -> Result<()> {
     // be present". A descriptor with neither has no expiry and no refresh hint,
     // so it would be cached indefinitely: reject it rather than pin the RD's keys
     // forever on a document that never goes stale.
-    if valid_until.is_none() && doc.get_attribute(root, "cacheDuration").is_none() {
+    if valid_until.is_none() && ed.cache_duration.is_none() {
         return Err(AuthError::Config(
             "metadata carries neither validUntil nor cacheDuration (eID §8.4 requires one)"
                 .to_string(),
@@ -486,14 +473,23 @@ fn pinned_signing_keys(keys: IdpKeys, trust: &RdTrust) -> Result<Vec<KeyPair>> {
 /// Resolve the three required endpoints (eID §3.1.1/§7.5/§7.7.1) and validate
 /// each as a clean absolute https URL (eID §9.4). The validation also keeps the
 /// values safe to interpolate downstream (HTML attribute, CSP, HTTP target).
-fn resolve_endpoints(
-    doc: &Document,
-    root: NodeId,
-) -> Result<(EndpointUrl, EndpointUrl, EndpointUrl)> {
+fn resolve_endpoints(idp: &IdpSsoDescriptor) -> Result<(EndpointUrl, EndpointUrl, EndpointUrl)> {
     Ok((
-        required_endpoint(doc, root, "SingleSignOnService", BINDING_HTTP_POST)?,
-        required_endpoint(doc, root, "ArtifactResolutionService", BINDING_SOAP)?,
-        required_endpoint(doc, root, "SingleLogoutService", BINDING_HTTP_POST)?,
+        required_endpoint(
+            &idp.single_sign_on_services,
+            "SingleSignOnService",
+            BINDING_HTTP_POST,
+        )?,
+        required_endpoint(
+            &idp.artifact_resolution_services,
+            "ArtifactResolutionService",
+            BINDING_SOAP,
+        )?,
+        required_endpoint(
+            &idp.single_logout_services,
+            "SingleLogoutService",
+            BINDING_HTTP_POST,
+        )?,
     ))
 }
 
@@ -807,29 +803,21 @@ mod tests {
                 <md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://idp-side/slo"/>
             </md:IDPSSODescriptor>
         </md:EntityDescriptor>"#;
-        let doc = crate::saml::xml_parser::parse(xml).unwrap();
-        let root = doc.document_element();
-        let idp = idp_sso_descriptor(&doc, root).expect("IDPSSODescriptor present");
+        let ed = entity_descriptor(xml);
+        let idp = idp_sso_descriptor(&ed).expect("IDPSSODescriptor present");
 
         assert_eq!(
-            endpoint_location(&doc, idp, "SingleLogoutService", BINDING_HTTP_POST).as_deref(),
+            endpoint_location(&idp.single_logout_services, BINDING_HTTP_POST),
             Some("https://idp-side/slo")
         );
         // The SP role's signing key is not an IdP signing key.
-        assert!(extract_idp_keys(&doc, idp).signing.is_empty());
-        // For contrast: from the EntityDescriptor the SP role would win, which is
-        // exactly what the scoping prevents.
-        assert_eq!(
-            endpoint_location(&doc, root, "SingleLogoutService", BINDING_HTTP_POST).as_deref(),
-            Some("https://sp-side/slo")
-        );
+        assert!(extract_idp_keys(idp).signing.is_empty());
     }
 
     #[test]
     fn metadata_without_an_idp_role_descriptor_is_rejected() {
         let xml = r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="urn:e"><md:SPSSODescriptor/></md:EntityDescriptor>"#;
-        let doc = crate::saml::xml_parser::parse(xml).unwrap();
-        let err = idp_sso_descriptor(&doc, doc.document_element()).unwrap_err();
+        let err = idp_sso_descriptor(&entity_descriptor(xml)).unwrap_err();
         assert!(err.to_string().contains("no IDPSSODescriptor"), "{err}");
     }
 
@@ -862,6 +850,15 @@ mod tests {
         assert!(matches!(err, AuthError::Crypto(_)));
     }
 
+    fn entity_descriptor(xml: &str) -> EntityDescriptor {
+        crate::saml::xml::from_str(xml).expect("test metadata parses")
+    }
+
+    /// The keys of the IDPSSODescriptor of `xml`.
+    fn idp_keys(xml: &str) -> IdpKeys {
+        extract_idp_keys(idp_sso_descriptor(&entity_descriptor(xml)).unwrap())
+    }
+
     fn metadata_xml(key_descriptors: &str) -> String {
         format!(
             r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="urn:test:rd">
@@ -881,8 +878,7 @@ mod tests {
             </md:KeyDescriptor>"#,
         );
 
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let keys = extract_idp_keys(&doc, doc.document_element());
+        let keys = idp_keys(&xml);
         assert_eq!(keys.signing.len(), 1);
         assert_eq!(keys.encryption.len(), 0);
         assert!(!keys.signing[0].key_name.as_str().is_empty());
@@ -900,8 +896,7 @@ mod tests {
             </md:KeyDescriptor>"#,
         );
 
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let keys = extract_idp_keys(&doc, doc.document_element());
+        let keys = idp_keys(&xml);
         assert_eq!(keys.signing.len(), 0);
         assert_eq!(keys.encryption.len(), 1);
     }
@@ -917,8 +912,7 @@ mod tests {
             </md:KeyDescriptor>"#,
         );
 
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let keys = extract_idp_keys(&doc, doc.document_element());
+        let keys = idp_keys(&xml);
         assert_eq!(keys.signing.len(), 1);
         assert_eq!(keys.encryption.len(), 1);
     }
@@ -932,16 +926,14 @@ mod tests {
             </md:KeyDescriptor>"#,
         );
 
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let keys = extract_idp_keys(&doc, doc.document_element());
+        let keys = idp_keys(&xml);
         assert_eq!(keys.signing.len(), 0);
     }
 
     #[test]
     fn empty_metadata_yields_no_keys() {
         let xml = metadata_xml("");
-        let doc = crate::saml::xml_parser::parse(&xml).unwrap();
-        let keys = extract_idp_keys(&doc, doc.document_element());
+        let keys = idp_keys(&xml);
         assert_eq!(keys.signing.len(), 0);
         assert_eq!(keys.encryption.len(), 0);
     }
@@ -954,10 +946,10 @@ mod tests {
                 <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://r/post"/>
             </md:IDPSSODescriptor>
         </md:EntityDescriptor>"#;
-        let doc = crate::saml::xml_parser::parse(xml).unwrap();
-        let root = doc.document_element();
-        let url = endpoint_location(&doc, root, "SingleSignOnService", BINDING_HTTP_POST);
-        assert_eq!(url.as_deref(), Some("https://r/post"));
+        let ed = entity_descriptor(xml);
+        let idp = idp_sso_descriptor(&ed).unwrap();
+        let url = endpoint_location(&idp.single_sign_on_services, BINDING_HTTP_POST);
+        assert_eq!(url, Some("https://r/post"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ bergshamra-keys = "0.9"
 cookie = "0.18"
 base64 = "0.23"
 sha1 = "0.11"
-roxmltree = "0.21"
+quick-xml = { version = "0.41", features = ["serialize", "overlapped-lists"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "aws-lc-rs"] }
 rustls-pki-types = "1"
 x509-cert = "0.3"
@@ -47,5 +47,6 @@ parking_lot = { workspace = true }
 secrecy = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true, features = ["form", "rustls"] }
+serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

@@ -22,12 +22,13 @@ use crate::{
         idp_metadata::IdpMetadata,
         loa::MINIMUM_LOA,
         messages::{CreatedMessage, create_artifact_resolve},
+        model::{ArtifactResponse, Assertion, Response as SamlResponse},
         validation::{
             Claims, ValidateArtifactResponseOpts, ValidateAssertionOpts, ValidateResponseOpts,
             validate_artifact_response_at, validate_assertion_at, validate_response_at,
         },
+        xml::Document,
         xml_builder::wrap_in_soap_envelope,
-        xml_parser::{Document, NodeId, parse},
     },
     state::{AuthFailure, AuthServiceState, AuthState},
     types::{Artifact, MessageId},
@@ -232,10 +233,10 @@ fn artifact_from_params(params: &HashMap<String, String>) -> Result<Artifact, Au
 }
 
 /// Parse the SOAP ArtifactResponse envelope exactly once; the whole
-/// ArtifactResponse -> Response -> Assertion chain is then navigated on this one
-/// tree, so inner elements keep the namespaces they inherit.
+/// ArtifactResponse -> Response -> Assertion chain is then read from this one
+/// document, so inner elements keep the namespaces they inherit.
 fn parse_soap_envelope(soap: &str) -> Result<Document<'_>, AuthFailure> {
-    parse(soap).map_err(|e| {
+    Document::parse(soap).map_err(|e| {
         error!("[ACS] Failed to parse SOAP ArtifactResponse: {e}");
         AuthFailure::Error
     })
@@ -254,8 +255,8 @@ async fn resolve_artifact_to_claims(
         .map_err(Rejection::Unanswered)?;
 
     // 3-5. Parse the SOAP ArtifactResponse exactly once and validate the
-    //      ArtifactResponse -> Response -> Assertion chain by navigating that
-    //      single tree. Inner elements (Response, Assertion) inherit their
+    //      ArtifactResponse -> Response -> Assertion chain from the models
+    //      read from that one document. Inner elements (Response, Assertion) inherit their
     //      namespaces from the ArtifactResponse and are never re-parsed as
     //      standalone fragments; signature verification uses the self-contained
     //      source bytes of the RD-signed ArtifactResponse element.
@@ -334,28 +335,21 @@ impl ResponseChain<'_, '_> {
         resolve_id: &MessageId,
         bound_authn_id: &MessageId,
     ) -> Result<Claims, Rejection> {
-        let root = self.doc.document_element();
-        let Some(art_node) = unwrap_soap(self.doc, root) else {
-            warn!(
-                "[ACS] Failed to unwrap SOAP envelope (root_element={:?})",
-                self.doc.local_name(root)
-            );
-            return Err(Rejection::Unanswered(AuthFailure::Error));
-        };
+        let art = unwrap_soap(self.doc).map_err(|e| {
+            warn!("[ACS] Failed to unwrap SOAP envelope: {e}");
+            Rejection::Unanswered(AuthFailure::Error)
+        })?;
 
         // 3. Validate ArtifactResponse (eID §7.6.1) using RD signing certs from metadata
-        let response_node = self
-            .response_node(art_node, resolve_id)
+        let response = self
+            .response(&art, resolve_id)
             .map_err(Rejection::Unanswered)?;
         // The Response is now RD-signed; from here on a failure is the RD's
         // answer to this browser's own flow, provided it names that flow.
-        check_answers_bound_request(self.doc, response_node, bound_authn_id)
-            .map_err(Rejection::Unanswered)?;
+        check_answers_bound_request(response, bound_authn_id).map_err(Rejection::Unanswered)?;
 
         // 4. Validate Response (eID §7.6.2): handle cancellation / IdP errors
-        let assertion_node = self
-            .assertion_node(response_node)
-            .map_err(Rejection::Answered)?;
+        let assertion = self.assertion(response).map_err(Rejection::Answered)?;
 
         // 5. Validate Assertion (eID §7.6.3, §7.6.3.5). The Assertion is
         //    authenticated by the enveloping RD signature on the ArtifactResponse
@@ -363,40 +357,37 @@ impl ResponseChain<'_, '_> {
         //    Assertion/Advice are validated. Binds the Assertion Issuer to the
         //    RD EntityID (`minvws/nl-rdo-max`).
         let claims = self
-            .assertion_claims(assertion_node)
+            .assertion_claims(assertion)
             .map_err(Rejection::Answered)?;
 
-        self.check_matching_in_response_to(response_node, &claims)
-            .map_err(Rejection::Answered)?;
+        check_matching_in_response_to(response, &claims).map_err(Rejection::Answered)?;
         Ok(claims)
     }
+}
 
-    // Cross-check only: both values come from the same Response, so this does
-    // NOT by itself satisfy eID §7.6.3.5 rule 4. Rule 4 (the assertion answers an
-    // AuthnRequest this DV actually issued) is enforced in
-    // `confirm_pending_request` below, which matches `claims.in_response_to`
-    // against the pending-request store and consumes it.
-    //
-    // What this adds on top: eID §7.6.2 gives the Response an @InResponseTo of
-    // cardinality 1, and it names the same AuthnRequest as the assertion's
-    // SubjectConfirmationData. Since only the assertion's value is checked
-    // against the store, requiring the two to agree rejects a Response whose
-    // envelope and assertion name different requests, i.e. an assertion spliced
-    // into a Response for another flow.
-    fn check_matching_in_response_to(
-        &self,
-        response_node: NodeId,
-        claims: &Claims,
-    ) -> Result<(), AuthFailure> {
-        let response_in_response_to = self.doc.get_attribute(response_node, "InResponseTo");
-        if response_in_response_to != claims.in_response_to.as_ref().map(MessageId::as_str) {
-            warn!(
-                "[ACS] Response @InResponseTo does not match the assertion's InResponseTo: rejecting"
-            );
-            return Err(AuthFailure::Error);
-        }
-        Ok(())
+// Cross-check only: both values come from the same Response, so this does
+// NOT by itself satisfy eID §7.6.3.5 rule 4. Rule 4 (the assertion answers an
+// AuthnRequest this DV actually issued) is enforced in
+// `confirm_pending_request` below, which matches `claims.in_response_to`
+// against the pending-request store and consumes it.
+//
+// What this adds on top: eID §7.6.2 gives the Response an @InResponseTo of
+// cardinality 1, and it names the same AuthnRequest as the assertion's
+// SubjectConfirmationData. Since only the assertion's value is checked
+// against the store, requiring the two to agree rejects a Response whose
+// envelope and assertion name different requests, i.e. an assertion spliced
+// into a Response for another flow.
+fn check_matching_in_response_to(
+    response: &SamlResponse,
+    claims: &Claims,
+) -> Result<(), AuthFailure> {
+    if response.in_response_to.as_deref() != claims.in_response_to.as_ref().map(MessageId::as_str) {
+        warn!(
+            "[ACS] Response @InResponseTo does not match the assertion's InResponseTo: rejecting"
+        );
+        return Err(AuthFailure::Error);
     }
+    Ok(())
 }
 
 /// Require the (RD-signed) Response to answer the AuthnRequest the browser's flow
@@ -406,11 +397,10 @@ impl ResponseChain<'_, '_> {
 /// `confirm_pending_request` later re-checks the assertion's copy of the ID
 /// against the store and consumes it.
 fn check_answers_bound_request(
-    doc: &Document,
-    response_node: NodeId,
+    response: &SamlResponse,
     bound_authn_id: &MessageId,
 ) -> Result<(), AuthFailure> {
-    if doc.get_attribute(response_node, "InResponseTo") != Some(bound_authn_id.as_str()) {
+    if response.in_response_to.as_deref() != Some(bound_authn_id.as_str()) {
         warn!(
             "[ACS] Response @InResponseTo is not the AuthnRequest the SSO flow cookie is \
              bound to: rejecting (possible login CSRF / forced login)"
@@ -469,11 +459,11 @@ async fn send_artifact_resolve(
 }
 
 impl ResponseChain<'_, '_> {
-    fn response_node(
+    fn response<'r>(
         &self,
-        art_node: NodeId,
+        art: &'r ArtifactResponse,
         expected_id: &MessageId,
-    ) -> Result<NodeId, AuthFailure> {
+    ) -> Result<&'r SamlResponse, AuthFailure> {
         debug!(
             "[ACS] Step 3: validating ArtifactResponse against {} RD signing key(s), \
              expected InResponseTo={}",
@@ -483,7 +473,7 @@ impl ResponseChain<'_, '_> {
         let mut errors = Vec::new();
         let response = validate_artifact_response_at(
             self.doc,
-            art_node,
+            art,
             &ValidateArtifactResponseOpts {
                 trusted_keys: &self.rd.signing_keys,
                 expected_in_response_to: Some(expected_id),
@@ -503,12 +493,12 @@ impl ResponseChain<'_, '_> {
         })
     }
 
-    fn assertion_node(&self, response_node: NodeId) -> Result<NodeId, AuthFailure> {
+    fn assertion<'r>(&self, response: &'r SamlResponse) -> Result<&'r Assertion, AuthFailure> {
         debug!("[ACS] Step 4: validating inner Response status");
         let mut errors = Vec::new();
         let assertion = validate_response_at(
             self.doc,
-            response_node,
+            response,
             // eID §7.6.2: bind the Response to this DV's ACS and the RD as issuer,
             // mirroring the assertion-level Recipient/Issuer checks (§7.6.3.5 r1-2).
             &ValidateResponseOpts {
@@ -541,7 +531,7 @@ impl ResponseChain<'_, '_> {
         })
     }
 
-    fn assertion_claims(&self, assertion_node: NodeId) -> Result<Claims, AuthFailure> {
+    fn assertion_claims(&self, assertion: &Assertion) -> Result<Claims, AuthFailure> {
         debug!("[ACS] Step 5: validating Assertion");
 
         let cfg = self.auth_state.auth_config();
@@ -550,7 +540,7 @@ impl ResponseChain<'_, '_> {
         let mut errors = Vec::new();
         let claims = validate_assertion_at(
             self.doc,
-            assertion_node,
+            assertion,
             &ValidateAssertionOpts {
                 dv_entity_id: &cfg.dv.entity_id,
                 expected_recipient: Some(&cfg.dv.acs_url),
@@ -787,8 +777,9 @@ mod tests {
     fn response_must_answer_the_bound_authn_request() {
         let bound = MessageId::parse("_mine").unwrap();
         let check = |xml: &str| {
-            let doc = parse(xml).expect("test Response parses");
-            check_answers_bound_request(&doc, doc.document_element(), &bound)
+            let response: SamlResponse =
+                crate::saml::xml::from_str(xml).expect("test Response parses");
+            check_answers_bound_request(&response, &bound)
         };
         const NS: &str = r#"xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol""#;
 
@@ -883,7 +874,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // The validation chain, driven over a real RD-signed ArtifactResponse
     // (built and signed here with the `rd-signing-1` fixture) so the
-    // ArtifactResponse -> Response -> Assertion navigation the handler performs
+    // ArtifactResponse -> Response -> Assertion validation the handler performs
     // is exercised rather than stubbed. Only the mTLS back-channel that would
     // deliver these bytes is left out.
     // -----------------------------------------------------------------------

@@ -4,10 +4,11 @@
 //! Run with: cargo test --test tvs_metadata -- --ignored
 
 use auth_service::saml::{
-    constants::{NS_DSIG, NS_MD},
+    constants::NS_MD,
     idp_metadata::{IdpKeys, extract_idp_keys},
+    model::{EntityDescriptor, IdpSsoDescriptor, Signed},
     verification::{ExpectedRoot, verify_xml_signature},
-    xml_parser::{Document, NodeId, descendants_by_tag, find_descendant, inner_text, parse},
+    xml::Document,
 };
 
 /// The root of any SAML metadata document; the `@ID` is the RD's own and is not
@@ -33,45 +34,46 @@ async fn fetch_metadata(url: &str) -> String {
 }
 
 fn validate_metadata(xml: &str, url: &str) {
-    let doc = parse(xml).unwrap_or_else(|e| panic!("{url}: XML parse error: {e}"));
-    let root = doc.document_element();
+    let doc = Document::parse(xml).unwrap_or_else(|e| panic!("{url}: XML parse error: {e}"));
+    assert!(
+        doc.root().is(NS_MD, "EntityDescriptor"),
+        "{url}: root element is not md:EntityDescriptor"
+    );
+    let ed: EntityDescriptor = doc
+        .deserialize()
+        .unwrap_or_else(|e| panic!("{url}: not an EntityDescriptor: {e}"));
 
-    validate_structure(&doc, root, url);
-    let keys = validate_key_descriptors(&doc, root, url);
-    validate_signature(xml, &doc, root, url, &keys);
+    let idp = validate_structure(&ed, url);
+    let keys = validate_key_descriptors(idp, url);
+    validate_signature(xml, &doc, url, &keys);
 }
 
 /// The document shape eID §8.4 requires of RD metadata: an `EntityDescriptor`
 /// root with an `entityID`, an `IDPSSODescriptor`, and the SSO and artifact
 /// resolution endpoints inside that role descriptor.
-fn validate_structure(doc: &Document, root: NodeId, url: &str) {
-    assert_eq!(
-        doc.local_name(root),
-        Some("EntityDescriptor"),
-        "{url}: root element is not EntityDescriptor"
-    );
-    assert!(
-        doc.get_attribute(root, "entityID").is_some(),
-        "{url}: missing entityID attribute"
-    );
+fn validate_structure<'e>(ed: &'e EntityDescriptor, url: &str) -> &'e IdpSsoDescriptor {
+    assert!(ed.entity_id.is_some(), "{url}: missing entityID attribute");
 
-    let idp = find_descendant(doc, root, NS_MD, "IDPSSODescriptor")
+    let idp = ed
+        .idp_sso_descriptor
+        .as_ref()
         .unwrap_or_else(|| panic!("{url}: missing IDPSSODescriptor"));
     assert!(
-        find_descendant(doc, idp, NS_MD, "SingleSignOnService").is_some(),
+        !idp.single_sign_on_services.is_empty(),
         "{url}: missing SingleSignOnService"
     );
     assert!(
-        find_descendant(doc, idp, NS_MD, "ArtifactResolutionService").is_some(),
+        !idp.artifact_resolution_services.is_empty(),
         "{url}: missing ArtifactResolutionService"
     );
+    idp
 }
 
 /// The published key material: the expected counts per use, and an explicit
 /// `use` attribute on every `KeyDescriptor` (a bare one, usable for both, would
 /// be a TVS misconfiguration).
-fn validate_key_descriptors(doc: &Document, root: NodeId, url: &str) -> IdpKeys {
-    let keys = extract_idp_keys(doc, root);
+fn validate_key_descriptors(idp: &IdpSsoDescriptor, url: &str) -> IdpKeys {
+    let keys = extract_idp_keys(idp);
 
     assert!(
         keys.signing.len() == 1 || keys.signing.len() == 2,
@@ -86,8 +88,8 @@ fn validate_key_descriptors(doc: &Document, root: NodeId, url: &str) -> IdpKeys 
         keys.encryption.len()
     );
 
-    for kd in descendants_by_tag(doc, root, NS_MD, "KeyDescriptor") {
-        let use_attr = doc.get_attribute(kd, "use");
+    for kd in &idp.key_descriptors {
+        let use_attr = kd.key_use.as_deref();
         assert!(
             use_attr == Some("signing") || use_attr == Some("encryption"),
             "{url}: KeyDescriptor has unexpected use attribute: {use_attr:?}"
@@ -99,14 +101,18 @@ fn validate_key_descriptors(doc: &Document, root: NodeId, url: &str) -> IdpKeys 
 /// The metadata signature: present, referencing one of the published signing
 /// certs by `KeyName`, verifying against the signing keys, and **not** verifying
 /// against an encryption-only key.
-fn validate_signature(xml: &str, doc: &Document, root: NodeId, url: &str, keys: &IdpKeys) {
-    let sig = find_descendant(doc, root, NS_DSIG, "Signature")
+fn validate_signature(xml: &str, doc: &Document, url: &str, keys: &IdpKeys) {
+    let signed: Signed = doc
+        .deserialize()
+        .unwrap_or_else(|e| panic!("{url}: malformed signature: {e}"));
+    let sig = signed
+        .signatures
+        .first()
         .unwrap_or_else(|| panic!("{url}: metadata is not signed"));
 
     // TVS metadata signatures use KeyName: the thumbprint we derive from a
     // published cert must match the KeyName in the Signature's KeyInfo.
-    if let Some(key_name_node) = find_descendant(doc, sig, NS_DSIG, "KeyName") {
-        let sig_key_name = inner_text(doc, key_name_node).unwrap_or_default();
+    if let Some(sig_key_name) = sig.key_info.as_ref().and_then(|k| k.key_names.first()) {
         let sig_key_name = sig_key_name.trim();
         assert!(
             keys.signing

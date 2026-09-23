@@ -19,7 +19,7 @@ use auth_service::{
             ValidateArtifactResponseOpts, ValidateAssertionOpts, ValidateResponseOpts,
             validate_artifact_response_at, validate_assertion_at, validate_response_at,
         },
-        xml_parser::parse,
+        xml::Document,
     },
     types::{EndpointUrl, EntityId, MessageId},
 };
@@ -485,19 +485,18 @@ fn signed_artifact_response_full_chain_succeeds() {
     let rd_key = load_key("rd-signing-1");
     let soap = signed_artifact_response_soap(&rd_key);
 
-    // The handler parses the SOAP response exactly once and navigates the single
-    // tree: ArtifactResponse, then Response, then Assertion. The inner elements
-    // inherit their namespaces from the ArtifactResponse and are never re-parsed
-    // as standalone fragments.
-    let doc = parse(&soap).unwrap();
-    let root = doc.document_element();
-    let art_node = unwrap_soap(&doc, root).expect("SOAP body unwrapped");
+    // The handler parses the SOAP response exactly once and reads the models
+    // from it: ArtifactResponse, then Response, then Assertion. The inner
+    // elements inherit their namespaces from the ArtifactResponse and are never
+    // re-parsed as standalone fragments.
+    let doc = Document::parse(&soap).unwrap();
+    let art = unwrap_soap(&doc).expect("SOAP body unwrapped");
 
     // Step 3: verify the ArtifactResponse envelope against the RD signing key.
     let mut errors = Vec::new();
-    let response_node = validate_artifact_response_at(
+    let response = validate_artifact_response_at(
         &doc,
-        art_node,
+        &art,
         &ValidateArtifactResponseOpts {
             trusted_keys: std::slice::from_ref(&rd_key),
             expected_in_response_to: None,
@@ -513,9 +512,9 @@ fn signed_artifact_response_full_chain_succeeds() {
 
     // Step 4: inner Response status is Success and carries an Assertion.
     let mut resp_errors = Vec::new();
-    let assertion_node = validate_response_at(
+    let assertion = validate_response_at(
         &doc,
-        response_node,
+        response,
         &ValidateResponseOpts {
             expected_destination: None,
             expected_issuer: None,
@@ -533,7 +532,7 @@ fn signed_artifact_response_full_chain_succeeds() {
     let mut assn_errors = Vec::new();
     let claims = validate_assertion_at(
         &doc,
-        assertion_node,
+        assertion,
         &ValidateAssertionOpts {
             dv_entity_id: &dv_entity_id(),
             expected_recipient: Some(&acs_url()),
@@ -562,14 +561,13 @@ fn signed_artifact_response_issuer_mismatch_rejected() {
     let rd_key = load_key("rd-signing-1");
     let soap = signed_artifact_response_soap(&rd_key);
 
-    let doc = parse(&soap).unwrap();
-    let root = doc.document_element();
-    let art_node = unwrap_soap(&doc, root).expect("SOAP body unwrapped");
+    let doc = Document::parse(&soap).unwrap();
+    let art = unwrap_soap(&doc).expect("SOAP body unwrapped");
 
     let mut errors = Vec::new();
     validate_artifact_response_at(
         &doc,
-        art_node,
+        &art,
         &ValidateArtifactResponseOpts {
             trusted_keys: std::slice::from_ref(&rd_key),
             expected_in_response_to: None,

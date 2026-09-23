@@ -10,9 +10,10 @@ use auth_service::{
     saml::{
         constants::{NS_DSIG, NS_MD},
         crypto::sign,
-        idp_metadata::extract_idp_keys,
+        idp_metadata::{IdpKeys, extract_idp_keys},
+        model::{EntityDescriptor, Signed},
         verification::{ExpectedRoot, verify_xml_signature},
-        xml_parser::{find_descendant, inner_text},
+        xml::{Document, from_str},
     },
 };
 
@@ -33,6 +34,16 @@ fn entity_descriptor_root() -> ExpectedRoot<'static> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The keys `extract_idp_keys` reads from the IDPSSODescriptor of `xml`.
+fn idp_keys(xml: &str) -> IdpKeys {
+    let ed: EntityDescriptor = from_str(xml).expect("metadata parses");
+    extract_idp_keys(
+        ed.idp_sso_descriptor
+            .as_ref()
+            .expect("IDPSSODescriptor present"),
+    )
+}
 
 /// Build a minimal IdP metadata document (unsigned).
 fn build_idp_metadata(entity_id: &str, id: &str, keys: &[(&str, &str, &str)]) -> String {
@@ -120,9 +131,7 @@ fn valid_metadata_key_extraction() {
     let key = load_key("rd-signing-1");
     let xml = signed_metadata(&key);
 
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
 
     assert_eq!(
         keys.signing.len(),
@@ -138,15 +147,15 @@ fn valid_metadata_has_correct_structure() {
     let key = load_key("rd-signing-1");
     let xml = signed_metadata(&key);
 
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    assert_eq!(doc.local_name(root), Some("EntityDescriptor"));
-    assert_eq!(doc.get_attribute(root, "entityID"), Some("urn:test:idp"));
-    assert!(doc.get_attribute(root, "ID").is_some());
-    assert!(find_descendant(&doc, root, NS_MD, "IDPSSODescriptor").is_some());
-    assert!(find_descendant(&doc, root, NS_DSIG, "Signature").is_some());
-    assert!(find_descendant(&doc, root, NS_MD, "SingleSignOnService").is_some());
-    assert!(find_descendant(&doc, root, NS_MD, "ArtifactResolutionService").is_some());
+    let doc = Document::parse(&xml).unwrap();
+    assert!(doc.root().is(NS_MD, "EntityDescriptor"));
+    let ed: EntityDescriptor = doc.deserialize().unwrap();
+    assert_eq!(ed.entity_id.as_deref(), Some("urn:test:idp"));
+    assert!(ed.id.is_some());
+    let idp = ed.idp_sso_descriptor.expect("IDPSSODescriptor present");
+    assert!(doc.elements().any(|e| e.is(NS_DSIG, "Signature")));
+    assert!(!idp.single_sign_on_services.is_empty());
+    assert!(!idp.artifact_resolution_services.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -273,9 +282,7 @@ fn key_extraction_bare_key_descriptor_goes_to_both() {
 </md:IDPSSODescriptor></md:EntityDescriptor>"#,
         key.cert_base64
     );
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
 
     assert_eq!(keys.signing.len(), 1, "bare key must appear in signing");
     assert_eq!(
@@ -296,9 +303,7 @@ fn key_extraction_signing_only_not_in_encryption() {
 </md:IDPSSODescriptor></md:EntityDescriptor>"#,
         key.cert_base64
     );
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
 
     assert_eq!(keys.signing.len(), 1);
     assert_eq!(
@@ -317,9 +322,7 @@ fn key_extraction_encryption_only_not_in_signing() {
 </md:IDPSSODescriptor></md:EntityDescriptor>"#,
         load_key("dv-encryption-1").cert_base64
     );
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
 
     assert_eq!(
         keys.signing.len(),
@@ -336,9 +339,7 @@ fn key_extraction_skips_key_name_only_descriptors() {
 <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
 <md:KeyDescriptor use="signing"><ds:KeyInfo><ds:KeyName>some-key-name</ds:KeyName></ds:KeyInfo></md:KeyDescriptor>
 </md:IDPSSODescriptor></md:EntityDescriptor>"#;
-    let doc = auth_service::saml::xml_parser::parse(xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(xml);
 
     assert_eq!(
         keys.signing.len(),
@@ -352,9 +353,7 @@ fn key_extraction_handles_empty_metadata() {
     let xml = r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="urn:test">
 <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
 </md:IDPSSODescriptor></md:EntityDescriptor>"#;
-    let doc = auth_service::saml::xml_parser::parse(xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(xml);
 
     assert_eq!(keys.signing.len(), 0);
     assert_eq!(keys.encryption.len(), 0);
@@ -370,9 +369,7 @@ fn rollover_metadata_contains_both_keys() {
     let key2 = load_key("dv-signing-1"); // use DV key as second signing key for testing
     let xml = signed_metadata_with_rollover(&key1, &key2, &key1);
 
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
 
     assert_eq!(keys.signing.len(), 2, "should extract both signing keys");
     let names: Vec<&str> = keys.signing.iter().map(|k| k.key_name.as_str()).collect();
@@ -389,9 +386,7 @@ fn rollover_metadata_verifies_with_either_advertised_key() {
     // succeed: that is the point of publishing both during a rollover.
     for signer in [&key1, &key2] {
         let xml = signed_metadata_with_rollover(&key1, &key2, signer);
-        let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-        let root = doc.document_element();
-        let keys = extract_idp_keys(&doc, root);
+        let keys = idp_keys(&xml);
         let result = verify_xml_signature(&xml, &keys.signing, &entity_descriptor_root());
         assert!(
             result.is_valid(),
@@ -409,16 +404,12 @@ fn rollover_old_key_removed_after_update() {
 
     // First metadata has key1 + key2
     let xml1 = signed_metadata_with_rollover(&key1, &key2, &key1);
-    let doc1 = auth_service::saml::xml_parser::parse(&xml1).unwrap();
-    let root1 = doc1.document_element();
-    let keys1 = extract_idp_keys(&doc1, root1);
+    let keys1 = idp_keys(&xml1);
     assert_eq!(keys1.signing.len(), 2);
 
     // Second metadata has only key1 (key2 removed after rollover)
     let xml2 = signed_metadata(&key1);
-    let doc2 = auth_service::saml::xml_parser::parse(&xml2).unwrap();
-    let root2 = doc2.document_element();
-    let keys2 = extract_idp_keys(&doc2, root2);
+    let keys2 = idp_keys(&xml2);
     assert_eq!(keys2.signing.len(), 1, "old rollover key should be gone");
     assert_eq!(keys2.signing[0].key_name, key1.key_name);
 }
@@ -432,9 +423,7 @@ fn extracted_key_name_matches_derived_key_name() {
     let key = load_key("rd-signing-1");
     let xml = signed_metadata(&key);
 
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
 
     // The key_name derived from the extracted PEM must match the original
     assert_eq!(
@@ -448,18 +437,18 @@ fn signature_x509cert_matches_metadata_key() {
     let key = load_key("rd-signing-1");
     let xml = signed_metadata(&key);
 
-    let doc = auth_service::saml::xml_parser::parse(&xml).unwrap();
-    let root = doc.document_element();
-    let sig = find_descendant(&doc, root, NS_DSIG, "Signature").expect("must have Signature");
-    let x509_node = find_descendant(&doc, sig, NS_DSIG, "X509Certificate")
-        .expect("Signature must have X509Certificate");
-    let sig_cert: String = inner_text(&doc, x509_node)
-        .expect("X509Certificate is a node of the parsed document")
+    let signed: Signed = from_str(&xml).unwrap();
+    let sig = signed.signatures.first().expect("must have Signature");
+    let sig_cert: String = sig
+        .key_info
+        .as_ref()
+        .and_then(|k| k.certificate())
+        .expect("Signature must have X509Certificate")
         .chars()
         .filter(|c: &char| !c.is_whitespace())
         .collect();
 
-    let keys = extract_idp_keys(&doc, root);
+    let keys = idp_keys(&xml);
     assert!(
         keys.signing
             .iter()
@@ -505,9 +494,7 @@ fn rejects_tampered_key_descriptor_cert() {
     let tampered = xml.replacen(&key.cert_base64.as_str()[..20], "AAAAAAAAAAAAAAAAAAAAAA", 1);
 
     // Re-extract keys from the tampered metadata; the cert is now different.
-    let doc = auth_service::saml::xml_parser::parse(&tampered).unwrap();
-    let root = doc.document_element();
-    let tampered_keys = extract_idp_keys(&doc, root);
+    let tampered_keys = idp_keys(&tampered);
 
     assert!(
         !tampered_keys.signing.is_empty(),

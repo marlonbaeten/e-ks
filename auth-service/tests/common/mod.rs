@@ -15,7 +15,7 @@ use auth_service::{
             Claims, ValidateArtifactResponseOpts, ValidateAssertionOpts, ValidateResponseOpts,
             validate_artifact_response_at, validate_assertion_at, validate_response_at,
         },
-        xml_parser::parse,
+        xml::Document,
     },
     types::{EndpointUrl, EntityId, MessageId},
 };
@@ -114,8 +114,8 @@ pub struct ChainResult {
     pub errors: Vec<String>,
 }
 
-/// Drive the exact handler chain (single parse, node navigation) over a SOAP
-/// envelope.
+/// Drive the exact handler chain (single parse, models read from it) over a
+/// SOAP envelope.
 pub fn run_chain(soap: &str, rd_key: &KeyPair) -> ChainResult {
     let mut errors = Vec::new();
     let rejected = |errors: Vec<String>| ChainResult {
@@ -123,17 +123,17 @@ pub fn run_chain(soap: &str, rd_key: &KeyPair) -> ChainResult {
         errors,
     };
 
-    let Ok(doc) = parse(soap) else {
+    let Ok(doc) = Document::parse(soap) else {
         return rejected(vec!["XML parse error".to_string()]);
     };
-    let root = doc.document_element();
-    let Some(art_node) = unwrap_soap(&doc, root) else {
-        return rejected(vec!["failed to unwrap SOAP envelope".to_string()]);
+    let art = match unwrap_soap(&doc) {
+        Ok(art) => art,
+        Err(e) => return rejected(vec![format!("failed to unwrap SOAP envelope: {e}")]),
     };
 
-    let response_node = validate_artifact_response_at(
+    let response = validate_artifact_response_at(
         &doc,
-        art_node,
+        &art,
         &ValidateArtifactResponseOpts {
             trusted_keys: std::slice::from_ref(rd_key),
             expected_in_response_to: None,
@@ -144,13 +144,13 @@ pub fn run_chain(soap: &str, rd_key: &KeyPair) -> ChainResult {
     if !errors.is_empty() {
         return rejected(errors);
     }
-    let Some(response_node) = response_node else {
+    let Some(response) = response else {
         return rejected(vec!["no Response extracted".to_string()]);
     };
 
-    let assertion_node = validate_response_at(
+    let assertion = validate_response_at(
         &doc,
-        response_node,
+        response,
         &ValidateResponseOpts {
             expected_destination: Some(&acs_url()),
             expected_issuer: Some(&rd_entity_id()),
@@ -160,13 +160,13 @@ pub fn run_chain(soap: &str, rd_key: &KeyPair) -> ChainResult {
     if !errors.is_empty() {
         return rejected(errors);
     }
-    let Some(assertion_node) = assertion_node else {
+    let Some(assertion) = assertion else {
         return rejected(vec!["no Assertion extracted".to_string()]);
     };
 
     let claims = validate_assertion_at(
         &doc,
-        assertion_node,
+        assertion,
         &ValidateAssertionOpts {
             dv_entity_id: &dv_entity_id(),
             expected_recipient: Some(&acs_url()),
@@ -186,9 +186,9 @@ pub fn run_chain(soap: &str, rd_key: &KeyPair) -> ChainResult {
 // ---------------------------------------------------------------------------
 // String-input validation wrappers (test-only).
 //
-// Production navigates the single parsed tree via the `_at` entry points; these
-// parse-then-delegate wrappers live here (rather than in the library) so the
-// crate's public API carries only the node-based validators it actually uses.
+// Production reads the models of one parsed document via the `_at` entry
+// points; these parse-then-delegate wrappers live here (rather than in the
+// library) so the crate's public API carries only the validators it uses.
 // ---------------------------------------------------------------------------
 
 pub struct ResponseResult {
@@ -201,8 +201,12 @@ pub struct ResponseResult {
 /// Assertion's source is returned whenever one was extracted, valid or not
 /// (some tests assert on it for rejected documents).
 pub fn validate_response(response_xml: &str) -> ResponseResult {
-    let doc = match parse(response_xml) {
-        Ok(d) => d,
+    let parsed = Document::parse(response_xml).and_then(|doc| {
+        let response = doc.deserialize()?;
+        Ok((doc, response))
+    });
+    let (doc, response) = match parsed {
+        Ok(parsed) => parsed,
         Err(e) => {
             return ResponseResult {
                 valid: false,
@@ -211,11 +215,10 @@ pub fn validate_response(response_xml: &str) -> ResponseResult {
             };
         }
     };
-    let root = doc.document_element();
     let mut errors = Vec::new();
     let assertion = validate_response_at(
         &doc,
-        root,
+        &response,
         &ValidateResponseOpts {
             expected_destination: None,
             expected_issuer: None,
@@ -224,7 +227,7 @@ pub fn validate_response(response_xml: &str) -> ResponseResult {
     );
     ResponseResult {
         valid: errors.is_empty(),
-        assertion_xml: assertion.and_then(|n| doc.node_source(n).map(str::to_string)),
+        assertion_xml: assertion.and_then(|a| doc.source(a.element).map(str::to_string)),
         errors,
     }
 }
@@ -243,7 +246,7 @@ pub fn validate_artifact_response(
     trusted_keys: &[KeyPair],
     expected_in_response_to: Option<&MessageId>,
 ) -> ArtifactResponseResult {
-    let doc = match parse(soap_xml) {
+    let doc = match Document::parse(soap_xml) {
         Ok(d) => d,
         Err(e) => {
             return ArtifactResponseResult {
@@ -253,18 +256,20 @@ pub fn validate_artifact_response(
             };
         }
     };
-    let root = doc.document_element();
-    let Some(art_node) = unwrap_soap(&doc, root) else {
-        return ArtifactResponseResult {
-            valid: false,
-            errors: vec!["Failed to unwrap SOAP envelope".to_string()],
-            response_xml: None,
-        };
+    let art = match unwrap_soap(&doc) {
+        Ok(art) => art,
+        Err(e) => {
+            return ArtifactResponseResult {
+                valid: false,
+                errors: vec![format!("Failed to unwrap SOAP envelope: {e}")],
+                response_xml: None,
+            };
+        }
     };
     let mut errors = Vec::new();
     let response = validate_artifact_response_at(
         &doc,
-        art_node,
+        &art,
         &ValidateArtifactResponseOpts {
             trusted_keys,
             expected_in_response_to,
@@ -276,7 +281,7 @@ pub fn validate_artifact_response(
     );
     ArtifactResponseResult {
         valid: errors.is_empty(),
-        response_xml: response.and_then(|n| doc.node_source(n).map(str::to_string)),
+        response_xml: response.and_then(|r| doc.source(r.element).map(str::to_string)),
         errors,
     }
 }
@@ -289,8 +294,12 @@ pub struct AssertionResult {
 
 /// Parse an Assertion and validate it against `opts`.
 pub fn validate_assertion(assertion_xml: &str, opts: ValidateAssertionOpts<'_>) -> AssertionResult {
-    let doc = match parse(assertion_xml) {
-        Ok(d) => d,
+    let parsed = Document::parse(assertion_xml).and_then(|doc| {
+        let assertion = doc.deserialize()?;
+        Ok((doc, assertion))
+    });
+    let (doc, assertion) = match parsed {
+        Ok(parsed) => parsed,
         Err(e) => {
             return AssertionResult {
                 errors: vec![format!("XML parse error: {e}")],
@@ -298,8 +307,7 @@ pub fn validate_assertion(assertion_xml: &str, opts: ValidateAssertionOpts<'_>) 
             };
         }
     };
-    let root = doc.document_element();
     let mut errors = Vec::new();
-    let claims = validate_assertion_at(&doc, root, &opts, &mut errors);
+    let claims = validate_assertion_at(&doc, &assertion, &opts, &mut errors);
     AssertionResult { errors, claims }
 }

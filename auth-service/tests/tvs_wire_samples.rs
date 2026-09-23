@@ -11,13 +11,14 @@
 use auth_service::{
     bindings::soap::unwrap_soap,
     saml::{
-        constants::{NS_SAMLP, STATUS_SUCCESS},
+        constants::STATUS_SUCCESS,
         loa::MINIMUM_LOA,
+        model::{ArtifactResponse, Response},
         validation::{
             Claims, ValidateArtifactResponseOpts, ValidateAssertionOpts, ValidateResponseOpts,
             validate_artifact_response_at, validate_assertion_at, validate_response_at,
         },
-        xml_parser::{Document, NodeId, find_child, parse},
+        xml::Document,
     },
     types::{EndpointUrl, EntityId, MessageId, ServiceUuid},
 };
@@ -96,14 +97,16 @@ fn shift_timestamps(xml: &str) -> String {
     out
 }
 
-fn artifact_response(doc: &Document) -> NodeId {
-    unwrap_soap(doc, doc.document_element()).expect("sample has a SOAP Body with one child")
+fn artifact_response(doc: &Document) -> ArtifactResponse {
+    unwrap_soap(doc).expect("sample has a SOAP Body with an ArtifactResponse")
 }
 
 /// The inner Response, reached without [`validate_artifact_response_at`], which
 /// would first fail on the signature we cannot verify.
-fn inner_response(doc: &Document, art: NodeId) -> NodeId {
-    find_child(doc, art, NS_SAMLP, "Response").expect("sample carries an inner Response")
+fn inner_response(art: &ArtifactResponse) -> &Response {
+    art.responses
+        .first()
+        .expect("sample carries an inner Response")
 }
 
 /// Run the Response (§7.6.2) and Assertion (§7.6.3) validators over a sample.
@@ -121,7 +124,7 @@ fn validate_sample(
     let service_uuid = ServiceUuid::parse(service_uuid).expect("fixture ServiceUUID");
 
     let art = artifact_response(doc);
-    let response = inner_response(doc, art);
+    let response = inner_response(&art);
 
     let assertion = validate_response_at(
         doc,
@@ -155,7 +158,7 @@ fn validate_sample(
 /// [`validate_sample`] on a time-shifted sample, asserting nothing was recorded.
 fn validate_shifted(name: &str, acs: &str, dv: &str, service_uuid: &str) -> Claims {
     let xml = shift_timestamps(&load(name));
-    let doc = parse(&xml).expect("real TVS ArtifactResponse parses");
+    let doc = Document::parse(&xml).expect("real TVS ArtifactResponse parses");
     let (claims, errors) = validate_sample(&doc, acs, dv, service_uuid);
     assert!(
         errors.is_empty(),
@@ -258,7 +261,7 @@ fn success_sample_unshifted_fails_only_the_time_checks() {
     ];
 
     let xml = load(success::FILE);
-    let doc = parse(&xml).expect("real TVS ArtifactResponse parses");
+    let doc = Document::parse(&xml).expect("real TVS ArtifactResponse parses");
     let (_, errors) = validate_sample(&doc, success::ACS, success::DV, success::SERVICE_UUID);
 
     let structural: Vec<&String> = errors
@@ -300,9 +303,9 @@ fn login_cancelled_sample_is_rejected_by_the_response_status_check() {
     // nested `Responder` / `AuthnFailed`, which `handle_acs` maps to
     // `AuthFailure::Cancelled`.
     let xml = load("artifact_response_login_cancelled.xml");
-    let doc = parse(&xml).expect("real TVS login-cancelled message parses");
+    let doc = Document::parse(&xml).expect("real TVS login-cancelled message parses");
     let art = artifact_response(&doc);
-    let response = inner_response(&doc, art);
+    let response = inner_response(&art);
 
     let mut errors = Vec::new();
     let assertion = validate_response_at(
@@ -337,18 +340,18 @@ fn request_denied_sample_is_rejected_at_the_artifact_layer() {
     // §7.6.1: the status is on the ArtifactResponse and there is no inner
     // Response at all.
     let xml = load("artifact_response_request_denied.xml");
-    let doc = parse(&xml).expect("real TVS request-denied message parses");
+    let doc = Document::parse(&xml).expect("real TVS request-denied message parses");
     let art = artifact_response(&doc);
 
     assert!(
-        find_child(&doc, art, NS_SAMLP, "Response").is_none(),
+        art.responses.is_empty(),
         "a denied request carries no inner Response"
     );
 
     let mut errors = Vec::new();
     let response = validate_artifact_response_at(
         &doc,
-        art,
+        &art,
         &ValidateArtifactResponseOpts {
             // No metadata for this environment, so the signature check fails
             // too; this test is about the status check reporting both levels.
@@ -380,9 +383,9 @@ fn pre_44_digid_sample_is_rejected_for_carrying_no_eid_identity() {
     assert!(xml.contains("s00000000:900029365"));
 
     let xml = shift_timestamps(&xml);
-    let doc = parse(&xml).expect("pre-4.4 DigiD message parses");
+    let doc = Document::parse(&xml).expect("pre-4.4 DigiD message parses");
     let art = artifact_response(&doc);
-    let response = inner_response(&doc, art);
+    let response = inner_response(&art);
 
     let idp = EntityId::parse("https://was-preprod1.digid.nl/saml/idp/metadata").expect("issuer");
     let dv = EntityId::parse("https://siam1.test.anoigo.nl/aselectserver/server").expect("DV");

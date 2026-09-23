@@ -6,7 +6,8 @@ use crate::{
     error::{AuthError, Result},
     saml::{
         constants::NS_SOAP,
-        xml_parser::{Document, NodeId, find_descendant},
+        model::{ArtifactResponse, Envelope},
+        xml::Document,
     },
     types::EndpointUrl,
 };
@@ -174,25 +175,45 @@ pub async fn send_soap_request(
     Ok(body)
 }
 
-/// Locate the first child element of the SOAP `<Body>` (the ArtifactResponse)
-/// as a node in the already-parsed document.
+/// The `samlp:ArtifactResponse` in the SOAP `<Body>` of the already-parsed
+/// document, or why there is none.
 ///
-/// The Body is matched by `(SOAP-envelope namespace, "Body")`, so any prefix
-/// bound to the SOAP 1.1 envelope namespace works, not just `soapenv:`. Returns
-/// the node so the caller navigates the single parsed tree (no re-parse).
-pub fn unwrap_soap(doc: &Document, root: NodeId) -> Option<NodeId> {
-    let body = find_descendant(doc, root, NS_SOAP, "Body")?;
-    doc.first_element_child(body)
+/// Envelope and Body are matched by `(SOAP-envelope namespace, local name)`, so
+/// any prefix bound to the SOAP 1.1 envelope namespace works, not just
+/// `soapenv:`. The ArtifactResponse is read from this one parse (no re-parse).
+pub fn unwrap_soap(doc: &Document) -> std::result::Result<ArtifactResponse, String> {
+    if !doc.root().is(NS_SOAP, "Envelope") {
+        return Err(format!(
+            "root element is {}, not a SOAP Envelope",
+            doc.root().qname()
+        ));
+    }
+    let envelope: Envelope = doc.deserialize().map_err(|e| e.to_string())?;
+    envelope
+        .body
+        .ok_or("SOAP Envelope has no Body")?
+        .artifact_response
+        .ok_or_else(|| {
+            // Name what the Body carries instead, e.g. a `soap:Fault`.
+            let body = doc
+                .elements()
+                .position(|e| e.parent() == Some(0) && e.is(NS_SOAP, "Body"));
+            let payload = doc
+                .elements()
+                .find(|e| body.is_some() && e.parent() == body)
+                .map_or_else(|| "nothing".to_string(), |e| e.qname().to_string());
+            format!("Expected ArtifactResponse in the SOAP Body, got {payload}")
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::saml::{constants::NS_SAMLP, xml_parser::parse};
+    use crate::saml::constants::NS_SAMLP;
 
-    fn root_of(doc: &Document) -> NodeId {
-        doc.document_element()
+    fn unwrap(xml: &str) -> std::result::Result<ArtifactResponse, String> {
+        unwrap_soap(&Document::parse(xml).unwrap())
     }
 
     #[test]
@@ -200,9 +221,7 @@ mod tests {
         let xml = format!(
             r#"<soapenv:Envelope xmlns:soapenv="{NS_SOAP}"><soapenv:Body><samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}" ID="_1">content</samlp:ArtifactResponse></soapenv:Body></soapenv:Envelope>"#
         );
-        let doc = parse(&xml).unwrap();
-        let body_child = unwrap_soap(&doc, root_of(&doc)).unwrap();
-        assert_eq!(doc.local_name(body_child), Some("ArtifactResponse"));
+        assert_eq!(unwrap(&xml).unwrap().id.as_deref(), Some("_1"));
     }
 
     #[test]
@@ -212,24 +231,27 @@ mod tests {
         let xml = format!(
             r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="{NS_SOAP}"><SOAP-ENV:Body><samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}">x</samlp:ArtifactResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#
         );
-        let doc = parse(&xml).unwrap();
-        let body_child = unwrap_soap(&doc, root_of(&doc)).unwrap();
-        assert_eq!(doc.local_name(body_child), Some("ArtifactResponse"));
+        assert!(unwrap(&xml).is_ok());
     }
 
     #[test]
-    fn unwrap_soap_returns_none_when_not_soap() {
-        let doc = parse(r#"<not-soap xmlns="urn:x">bad</not-soap>"#).unwrap();
-        assert!(unwrap_soap(&doc, root_of(&doc)).is_none());
-    }
-
-    #[test]
-    fn unwrap_soap_returns_none_for_empty_body() {
+    fn unwrap_soap_fails_when_not_soap() {
+        assert!(unwrap(r#"<not-soap xmlns="urn:x">bad</not-soap>"#).is_err());
+        // The right local names in the wrong namespace are not SOAP either.
         let xml = format!(
-            r#"<soapenv:Envelope xmlns:soapenv="{NS_SOAP}"><soapenv:Body>   </soapenv:Body></soapenv:Envelope>"#
+            r#"<Envelope xmlns="urn:x"><Body><samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}"/></Body></Envelope>"#
         );
-        let doc = parse(&xml).unwrap();
-        assert!(unwrap_soap(&doc, root_of(&doc)).is_none());
+        assert!(unwrap(&xml).is_err());
+    }
+
+    #[test]
+    fn unwrap_soap_fails_for_an_empty_body_or_another_payload() {
+        for body in ["   ", r#"<soapenv:Fault/>"#] {
+            let xml = format!(
+                r#"<soapenv:Envelope xmlns:soapenv="{NS_SOAP}"><soapenv:Body>{body}</soapenv:Body></soapenv:Envelope>"#
+            );
+            assert!(unwrap(&xml).is_err(), "{body:?}");
+        }
     }
 
     fn fixture_tls() -> TlsConfig {

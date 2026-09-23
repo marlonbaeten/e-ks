@@ -9,9 +9,8 @@ use crate::{
     saml::{
         constants::{NS_SAML, NS_XENC},
         crypto,
-        xml_parser::{
-            Document, NodeId, descendants_by_tag, direct_text, find_child, find_descendant,
-        },
+        model::{DecryptedId, EncryptedId, EncryptedKey, NameId},
+        xml::Document,
     },
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -61,19 +60,35 @@ pub struct DecryptedNameId {
 /// EntityID among the audiences).
 fn check_encryption_algorithms(
     doc: &Document,
-    enc_id: NodeId,
+    enc_id: &EncryptedId,
     dv_entity_id: Option<&str>,
 ) -> Result<(), String> {
-    check_data_encryption(doc, enc_id)?;
-    check_key_transport(doc, &our_encrypted_keys(doc, enc_id, dv_entity_id)?)
+    check_data_encryption(enc_id)?;
+    check_placement(doc, enc_id)?;
+    check_key_transport(&our_encrypted_keys(enc_id, dv_entity_id)?)
+}
+
+/// Every `EncryptedKey` of the EncryptedID: in the `EncryptedData`'s `KeyInfo`
+/// or beside it (SAML core §2.2.4).
+fn encrypted_keys(enc_id: &EncryptedId) -> impl Iterator<Item = &EncryptedKey> {
+    let in_key_info = enc_id
+        .encrypted_data
+        .iter()
+        .flat_map(|d| &d.key_info)
+        .flat_map(|k| &k.encrypted_keys);
+    enc_id.encrypted_keys.iter().chain(in_key_info)
 }
 
 // eID §9.3: the `EncryptedData` block cipher MUST be AES-256-CBC.
-fn check_data_encryption(doc: &Document, enc_id: NodeId) -> Result<(), String> {
-    let enc_data = find_descendant(doc, enc_id, NS_XENC, "EncryptedData")
+fn check_data_encryption(enc_id: &EncryptedId) -> Result<(), String> {
+    let enc_data = enc_id
+        .encrypted_data
+        .as_ref()
         .ok_or_else(|| "EncryptedID has no EncryptedData".to_string())?;
-    let data_alg = find_child(doc, enc_data, NS_XENC, "EncryptionMethod")
-        .and_then(|n| doc.get_attribute(n, "Algorithm"))
+    let data_alg = enc_data
+        .encryption_method
+        .as_ref()
+        .and_then(|m| m.algorithm.as_deref())
         .ok_or_else(|| "EncryptedData has no EncryptionMethod Algorithm".to_string())?;
     if !ALLOWED_DATA_ENCRYPTION.contains(&data_alg) {
         return Err(format!(
@@ -83,32 +98,53 @@ fn check_data_encryption(doc: &Document, enc_id: NodeId) -> Result<(), String> {
     Ok(())
 }
 
+/// SECURITY: the backend decrypts the whole EncryptedID from its source bytes,
+/// so it could pick up an `EncryptedData` / `EncryptedKey` nested somewhere the
+/// model does not read, which the allow-list would then never have checked.
+/// Require every one in the subtree to be a modelled one.
+fn check_placement(doc: &Document, enc_id: &EncryptedId) -> Result<(), String> {
+    let in_subtree = |local: &str| {
+        doc.descendants(enc_id.element)
+            .filter(|e| e.is(NS_XENC, local))
+            .count()
+    };
+    if in_subtree("EncryptedData") != usize::from(enc_id.encrypted_data.is_some())
+        || in_subtree("EncryptedKey") != encrypted_keys(enc_id).count()
+    {
+        return Err(
+            "EncryptedID carries an EncryptedData or EncryptedKey outside the positions SAML \
+             core §2.2.4 allows"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 // eID §7.6.3.4: `@Recipient` identifies the intended recipient of each wrapped
 // key. When we know our own EntityID, consider only our keys; more than one may
 // carry it (§7.6.3.4: one per encryption cert during rollover). At least one
 // key must be ours.
-fn our_encrypted_keys(
-    doc: &Document,
-    enc_id: NodeId,
+fn our_encrypted_keys<'e>(
+    enc_id: &'e EncryptedId,
     dv_entity_id: Option<&str>,
-) -> Result<Vec<NodeId>, String> {
-    let enc_keys = descendants_by_tag(doc, enc_id, NS_XENC, "EncryptedKey");
+) -> Result<Vec<&'e EncryptedKey>, String> {
+    let enc_keys: Vec<&EncryptedKey> = encrypted_keys(enc_id).collect();
     if enc_keys.is_empty() {
         return Err("EncryptedID has no EncryptedKey".to_string());
     }
 
-    let ours: Vec<NodeId> = match dv_entity_id {
+    let ours: Vec<&EncryptedKey> = match dv_entity_id {
         Some(dv) => enc_keys
             .iter()
             .copied()
-            .filter(|&ek| doc.get_attribute(ek, "Recipient") == Some(dv))
+            .filter(|ek| ek.recipient.as_deref() == Some(dv))
             .collect(),
         None => enc_keys.clone(),
     };
     if ours.is_empty() {
         let recipients: Vec<&str> = enc_keys
             .iter()
-            .map(|&ek| doc.get_attribute(ek, "Recipient").unwrap_or("<absent>"))
+            .map(|ek| ek.recipient.as_deref().unwrap_or("<absent>"))
             .collect();
         return Err(format!(
             "no EncryptedKey addressed to this DV (eID §7.6.3.4 @Recipient); saw {recipients:?}"
@@ -118,10 +154,12 @@ fn our_encrypted_keys(
 }
 
 // eID §9.3: every `EncryptedKey` addressed to us MUST use RSA-OAEP transport.
-fn check_key_transport(doc: &Document, enc_keys: &[NodeId]) -> Result<(), String> {
-    for &ek in enc_keys {
-        let key_alg = find_child(doc, ek, NS_XENC, "EncryptionMethod")
-            .and_then(|n| doc.get_attribute(n, "Algorithm"))
+fn check_key_transport(enc_keys: &[&EncryptedKey]) -> Result<(), String> {
+    for ek in enc_keys {
+        let key_alg = ek
+            .encryption_method
+            .as_ref()
+            .and_then(|m| m.algorithm.as_deref())
             .ok_or_else(|| "EncryptedKey has no EncryptionMethod Algorithm".to_string())?;
         if !ALLOWED_KEY_TRANSPORT.contains(&key_alg) {
             return Err(format!(
@@ -132,14 +170,15 @@ fn check_key_transport(doc: &Document, enc_keys: &[NodeId]) -> Result<(), String
     Ok(())
 }
 
-/// Decrypt an EncryptedID element per eID §7.6.3.4.4.
+/// Decrypt an EncryptedID element per eID §7.6.3.4.4. `enc_id` was read from
+/// `doc`, which supplies the element's source bytes for the crypto backend.
 ///
 /// `private_keys`: the DV decryption keys to try. `dv_entity_id` is our own
 /// EntityID, used to select the `EncryptedKey` addressed to us
 /// (eID §7.6.3.4 `@Recipient`); `None` skips that binding (tests).
 pub fn decrypt_encrypted_id(
     doc: &Document,
-    enc_id: NodeId,
+    enc_id: &EncryptedId,
     private_keys: &[DecryptionKey<'_>],
     dv_entity_id: Option<&str>,
 ) -> Option<DecryptedNameId> {
@@ -153,19 +192,18 @@ pub fn decrypt_encrypted_id(
     // Normally self-contained; when the namespaces are declared on an ancestor,
     // restore the inherited ones. The backend only locates the ciphertext, so this
     // cannot affect what is decrypted.
-    let enc_id_xml = self_contained_source(doc, enc_id)?;
+    let enc_id_xml = doc.standalone_source(enc_id.element)?;
     let decrypted_xml = decrypt_ciphertext(&enc_id_xml, private_keys)?;
 
     // eID §7.6.3.4.4: "An <EncryptedID> MUST contain a SAML <NameID> after
     // decryption". Require exactly that, matched by namespace, so plaintext that
     // decrypts to some other element never becomes an identity.
-    let dec_doc = crate::saml::xml_parser::parse(&decrypted_xml).ok()?;
-    let Some(name_id_node) = decrypted_name_id_node(&dec_doc) else {
+    let Some(name_id) = decrypted_name_id(&decrypted_xml) else {
         warn!("[decrypt] Decrypted EncryptedID does not contain a saml:NameID; rejecting");
         return None;
     };
 
-    let result = name_id_fields(&dec_doc, name_id_node);
+    let result = name_id_fields(name_id);
     // SECURITY: only log non-PII metadata; `value` is the decrypted PII
     // (BSN / pseudonym) and MUST stay out of logs.
     debug!(
@@ -175,18 +213,6 @@ pub fn decrypt_encrypted_id(
         result.value.expose_secret().len()
     );
     Some(result)
-}
-
-/// `node` as a standalone document: raw bytes when those parse, else with the
-/// inherited namespace declarations restored. Mirrors the signature path.
-fn self_contained_source(doc: &Document, node: NodeId) -> Option<String> {
-    let raw = doc.node_source(node)?;
-    if crate::saml::xml_parser::parse(raw).is_ok() {
-        return Some(raw.to_string());
-    }
-    let reconstructed = doc.node_source_with_inherited_namespaces(node)?;
-    crate::saml::xml_parser::parse(&reconstructed).ok()?;
-    Some(reconstructed)
 }
 
 /// Hand the self-contained EncryptedID XML to the crypto backend, trying each
@@ -223,40 +249,31 @@ fn decrypt_ciphertext(enc_id_xml: &str, private_keys: &[DecryptionKey<'_>]) -> O
     }
 }
 
-/// The `saml:NameID` element of the decrypted plaintext, matched by namespace;
-/// the document element itself might be the NameID.
-fn decrypted_name_id_node(dec_doc: &Document) -> Option<NodeId> {
-    let dec_root = dec_doc.document_element();
-    find_descendant(dec_doc, dec_root, NS_SAML, "NameID")
-        .or_else(|| (dec_doc.local_name(dec_root)? == "NameID").then_some(dec_root))
+/// The `saml:NameID` of the decrypted plaintext: the `EncryptedID` with its
+/// `EncryptedData` replaced by the NameID, or the NameID on its own.
+fn decrypted_name_id(decrypted_xml: &str) -> Option<NameId> {
+    let doc = Document::parse(decrypted_xml).ok()?;
+    let root = doc.root();
+    if root.is(NS_SAML, "NameID") {
+        doc.deserialize().ok()
+    } else if root.is(NS_SAML, "EncryptedID") {
+        doc.deserialize::<DecryptedId>().ok()?.name_id
+    } else {
+        None
+    }
 }
 
 /// Lift the NameID text and its eID §7.6.3.4.4 attributes into owned fields.
-fn name_id_fields(dec_doc: &Document, name_id_node: NodeId) -> DecryptedNameId {
+fn name_id_fields(name_id: NameId) -> DecryptedNameId {
     DecryptedNameId {
-        // `direct_text`: the identifier is the NameID's own text. Element children
-        // yield an empty value, which `check_decrypted_name_id` rejects.
-        // Trimmed like every other text value, so a pretty-printed NameID
-        // matches the identifier it carries.
-        value: SecretString::from(
-            direct_text(dec_doc, name_id_node)
-                .map(|text| text.trim().to_string())
-                .unwrap_or_default(),
-        ),
-        format: dec_doc
-            .get_attribute(name_id_node, "Format")
-            .unwrap_or("")
-            .to_string(),
-        name_qualifier: dec_doc
-            .get_attribute(name_id_node, "NameQualifier")
-            .unwrap_or("")
-            .to_string(),
-        sp_name_qualifier: dec_doc
-            .get_attribute(name_id_node, "SPNameQualifier")
-            .map(str::to_string),
-        sp_provided_id: dec_doc
-            .get_attribute(name_id_node, "SPProvidedID")
-            .map(str::to_string),
+        // The identifier is the NameID's own text. Trimmed like every other text
+        // value, so a pretty-printed NameID matches the identifier it carries; an
+        // empty one is rejected by `check_decrypted_name_id`.
+        value: SecretString::from(name_id.value.trim().to_string()),
+        format: name_id.format.unwrap_or_default(),
+        name_qualifier: name_id.name_qualifier.unwrap_or_default(),
+        sp_name_qualifier: name_id.sp_name_qualifier,
+        sp_provided_id: name_id.sp_provided_id,
     }
 }
 
@@ -265,10 +282,7 @@ mod tests {
     use super::*;
     use crate::{
         keys::{CertificatePem, PrivateKeyPem},
-        saml::{
-            constants::{NAMEID_PERSISTENT, NS_SAML},
-            xml_parser::parse,
-        },
+        saml::constants::{NAMEID_PERSISTENT, NS_SAML},
     };
     use bergshamra_enc::{EncContext, encrypt::encrypt};
     use bergshamra_keys::{KeysManager, loader};
@@ -276,6 +290,13 @@ mod tests {
 
     /// Our own EntityID, the `@Recipient` the RD addresses our wrapped keys to.
     const DV_ENTITY_ID: &str = "urn:nl-eid-gdi:1.0:DV:test:entities:9001";
+
+    /// Parse a standalone `<saml:EncryptedID>`.
+    fn parse(xml: &str) -> (Document<'_>, EncryptedId) {
+        let doc = Document::parse(xml).expect("parse EncryptedID");
+        let enc_id = doc.deserialize().expect("EncryptedID deserializes");
+        (doc, enc_id)
+    }
 
     fn fixture(name: &str) -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -307,7 +328,7 @@ mod tests {
 
     /// Full XML-Enc round-trip: encrypt a NameID to the DV's public key, then run
     /// the production decryption path and assert the recovered identifier. This
-    /// exercises the decrypt + re-parse path (including roxmltree's namespace
+    /// exercises the decrypt + re-parse path (including namespace
     /// strictness on the decrypted plaintext), which the structural unit tests do
     /// not cover.
     #[test]
@@ -325,15 +346,14 @@ mod tests {
         // Sanity: encryption actually filled the ciphertext (no plaintext leak).
         assert!(!encrypted_id_xml.contains("900070341"));
 
-        let doc = parse(&encrypted_id_xml).expect("parse EncryptedID");
-        let enc_id = doc.document_element();
+        let (doc, enc_id) = parse(&encrypted_id_xml);
 
         let key_pem = PrivateKeyPem::new(key_pem);
         let private_keys = [DecryptionKey {
             key_pem: &key_pem,
             key_name: &key_name,
         }];
-        let decrypted = decrypt_encrypted_id(&doc, enc_id, &private_keys, Some(DV_ENTITY_ID))
+        let decrypted = decrypt_encrypted_id(&doc, &enc_id, &private_keys, Some(DV_ENTITY_ID))
             .expect("decryption must recover the NameID");
 
         assert_eq!(decrypted.value.expose_secret(), "900070341");
@@ -353,8 +373,7 @@ mod tests {
         );
         let encrypted_id_xml = encrypt_name_id(&cert_pem, key_name.as_str(), &name_id_xml);
 
-        let doc = parse(&encrypted_id_xml).expect("parse EncryptedID");
-        let enc_id = doc.document_element();
+        let (doc, enc_id) = parse(&encrypted_id_xml);
 
         // Present a different key under the same KeyName: unwrap must fail.
         let other_key = PrivateKeyPem::new(fixture("dv-encryption-2-key.pem"));
@@ -362,7 +381,7 @@ mod tests {
             key_pem: &other_key,
             key_name: &key_name,
         }];
-        assert!(decrypt_encrypted_id(&doc, enc_id, &private_keys, Some(DV_ENTITY_ID)).is_none());
+        assert!(decrypt_encrypted_id(&doc, &enc_id, &private_keys, Some(DV_ENTITY_ID)).is_none());
     }
 
     /// eID §9.3: a fragment wrapped to the *second* configured key (rollover) must
@@ -381,8 +400,7 @@ mod tests {
             r#"<saml:NameID xmlns:saml="{NS_SAML}" Format="{NAMEID_PERSISTENT}" NameQualifier="urn:nl-eid-gdi:1.0:id:legacy-BSN">900070341</saml:NameID>"#
         );
         let encrypted_id_xml = encrypt_name_id(&cert2, kn2.as_str(), &name_id_xml);
-        let doc = parse(&encrypted_id_xml).expect("parse EncryptedID");
-        let enc_id = doc.document_element();
+        let (doc, enc_id) = parse(&encrypted_id_xml);
 
         // key1 (wrong) is listed before key2 (correct); decryption must still work.
         let (key1, key2) = (PrivateKeyPem::new(key1), PrivateKeyPem::new(key2));
@@ -396,7 +414,7 @@ mod tests {
                 key_name: &kn2,
             },
         ];
-        let decrypted = decrypt_encrypted_id(&doc, enc_id, &private_keys, Some(DV_ENTITY_ID))
+        let decrypted = decrypt_encrypted_id(&doc, &enc_id, &private_keys, Some(DV_ENTITY_ID))
             .expect("rollover: a blob wrapped to the second key must decrypt");
         assert_eq!(decrypted.value.expose_secret(), "900070341");
     }
@@ -419,10 +437,8 @@ mod tests {
             "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
             "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
         );
-        let doc = parse(&xml).unwrap();
-        assert!(
-            check_encryption_algorithms(&doc, doc.document_element(), Some(DV_ENTITY_ID)).is_ok()
-        );
+        let (doc, enc_id) = parse(&xml);
+        assert!(check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID)).is_ok());
     }
 
     #[test]
@@ -432,20 +448,16 @@ mod tests {
             "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
             "http://www.w3.org/2001/04/xmlenc#rsa-1_5",
         );
-        let doc = parse(&rsa15).unwrap();
-        assert!(
-            check_encryption_algorithms(&doc, doc.document_element(), Some(DV_ENTITY_ID)).is_err()
-        );
+        let (doc, enc_id) = parse(&rsa15);
+        assert!(check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID)).is_err());
 
         // A weaker data cipher (AES-128-CBC) is rejected.
         let aes128 = encrypted_id_with_algs(
             "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
             "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
         );
-        let doc = parse(&aes128).unwrap();
-        assert!(
-            check_encryption_algorithms(&doc, doc.document_element(), Some(DV_ENTITY_ID)).is_err()
-        );
+        let (doc, enc_id) = parse(&aes128);
+        assert!(check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID)).is_err());
     }
 
     #[test]
@@ -458,8 +470,8 @@ mod tests {
             "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
             "urn:nl-eid-gdi:1.0:DV:someone-else:entities:0001",
         );
-        let doc = parse(&xml).unwrap();
-        let err = check_encryption_algorithms(&doc, doc.document_element(), Some(DV_ENTITY_ID))
+        let (doc, enc_id) = parse(&xml);
+        let err = check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID))
             .expect_err("a key for another recipient must be rejected");
         assert!(
             err.contains("no EncryptedKey addressed to this DV"),
@@ -475,18 +487,18 @@ mod tests {
         let ours_ok = format!(
             r#"<saml:EncryptedID xmlns:saml="{NS_SAML}" xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><xenc:EncryptedData><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/><ds:KeyInfo><xenc:EncryptedKey Recipient="urn:other"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/></xenc:EncryptedKey><xenc:EncryptedKey Recipient="{DV_ENTITY_ID}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/></xenc:EncryptedKey></ds:KeyInfo></xenc:EncryptedData></saml:EncryptedID>"#
         );
-        let doc = parse(&ours_ok).unwrap();
+        let (doc, enc_id) = parse(&ours_ok);
         assert!(
-            check_encryption_algorithms(&doc, doc.document_element(), Some(DV_ENTITY_ID)).is_ok(),
+            check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID)).is_ok(),
             "a foreign weak key must not fail a message whose own key is sound"
         );
 
         let ours_weak = format!(
             r#"<saml:EncryptedID xmlns:saml="{NS_SAML}" xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><xenc:EncryptedData><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/><ds:KeyInfo><xenc:EncryptedKey Recipient="urn:other"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/></xenc:EncryptedKey><xenc:EncryptedKey Recipient="{DV_ENTITY_ID}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/></xenc:EncryptedKey></ds:KeyInfo></xenc:EncryptedData></saml:EncryptedID>"#
         );
-        let doc = parse(&ours_weak).unwrap();
+        let (doc, enc_id) = parse(&ours_weak);
         assert!(
-            check_encryption_algorithms(&doc, doc.document_element(), Some(DV_ENTITY_ID)).is_err(),
+            check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID)).is_err(),
             "our own key using rsa-1_5 must be rejected"
         );
     }
@@ -502,21 +514,29 @@ mod tests {
         let not_a_name_id =
             r#"<NameID xmlns="urn:attacker:ns" Format="x">900070341</NameID>"#.to_string();
         let encrypted = encrypt_name_id(&cert, key_name.as_str(), &not_a_name_id);
-        let doc = parse(&encrypted).expect("parse EncryptedID");
+        let (doc, enc_id) = parse(&encrypted);
         let key = PrivateKeyPem::new(key);
         let private_keys = [DecryptionKey {
             key_pem: &key,
             key_name: &key_name,
         }];
         assert!(
-            decrypt_encrypted_id(
-                &doc,
-                doc.document_element(),
-                &private_keys,
-                Some(DV_ENTITY_ID)
-            )
-            .is_none(),
+            decrypt_encrypted_id(&doc, &enc_id, &private_keys, Some(DV_ENTITY_ID)).is_none(),
             "plaintext without a saml:NameID must be rejected"
         );
+    }
+
+    #[test]
+    fn an_encrypted_key_outside_the_modelled_positions_is_rejected() {
+        // The backend sees the whole EncryptedID, so an EncryptedKey nested where
+        // the allow-list does not look (here inside a foreign wrapper) must fail
+        // the message rather than reach the backend unchecked.
+        let xml = format!(
+            r#"<saml:EncryptedID xmlns:saml="{NS_SAML}" xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><xenc:EncryptedData><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/><ds:KeyInfo><xenc:EncryptedKey Recipient="{DV_ENTITY_ID}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/></xenc:EncryptedKey><x:Wrapper xmlns:x="urn:x"><xenc:EncryptedKey Recipient="{DV_ENTITY_ID}"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-1_5"/></xenc:EncryptedKey></x:Wrapper></ds:KeyInfo></xenc:EncryptedData></saml:EncryptedID>"#
+        );
+        let (doc, enc_id) = parse(&xml);
+        let err = check_encryption_algorithms(&doc, &enc_id, Some(DV_ENTITY_ID))
+            .expect_err("an unchecked EncryptedKey must be rejected");
+        assert!(err.contains("outside the positions"), "{err}");
     }
 }

@@ -1,19 +1,19 @@
-//! Shared validation context and XML/SOAP helpers for the SAML validators.
+//! Shared validation context and checks for the SAML validators.
 
 use crate::{
     saml::{
-        constants::{
-            CLOCK_SKEW_SECONDS, MESSAGE_FRESHNESS_SECONDS, NS_SAML, NS_SAMLP, STATUS_SUCCESS,
-        },
-        xml_parser::{Document, NodeId, direct_text, find_child, find_descendant, inner_text},
+        constants::{CLOCK_SKEW_SECONDS, MESSAGE_FRESHNESS_SECONDS, STATUS_SUCCESS},
+        model::Status,
+        xml::Document,
     },
     types::EntityId,
 };
 use chrono::{DateTime, Duration, Utc};
 
-/// Context threaded through every validation step: the parsed document, one
-/// wall-clock reference with the eID §9.5 clock-skew allowance, and the error
-/// accumulator the checks push their findings onto.
+/// Context threaded through every validation step: the parsed document (for the
+/// source bytes of signed and encrypted elements), one wall-clock reference with
+/// the eID §9.5 clock-skew allowance, and the error accumulator the checks push
+/// their findings onto.
 ///
 /// Mirrors the validators' contract: checks never abort, they record errors;
 /// the caller treats the result as valid only when no error was recorded.
@@ -40,8 +40,8 @@ impl<'a, 'input> Validator<'a, 'input> {
 
     /// eID §7.6.1/§7.6.2/§7.6.3 (and SAML core): `@Version` MUST be exactly `2.0`.
     /// A missing or differing version fails closed rather than being ignored.
-    pub fn check_version(&mut self, node: NodeId, label: &str) {
-        match self.doc.get_attribute(node, "Version") {
+    pub fn check_version(&mut self, version: Option<&str>, label: &str) {
+        match version {
             Some("2.0") => {}
             Some(v) => self.error(format!(
                 "{label} has unsupported @Version {v:?} (MUST be 2.0)"
@@ -50,43 +50,47 @@ impl<'a, 'input> Validator<'a, 'input> {
         }
     }
 
-    /// eID §7.6.1/§7.6.2/§7.6.3.5 rule 1: the `<saml:Issuer>` of `node` MUST be the
-    /// pinned RD EntityID, so an RD-signed envelope naming a different entity is
-    /// rejected. `None` skips the check (tests).
-    pub fn check_issuer(&mut self, node: NodeId, expected_issuer: Option<&EntityId>, label: &str) {
+    /// eID §7.6.1/§7.6.2/§7.6.3.5 rule 1: the `<saml:Issuer>` MUST be the pinned
+    /// RD EntityID, so an RD-signed envelope naming a different entity is
+    /// rejected. `None` skips the check (tests). (An Issuer with element children
+    /// never gets here: the model rejects it at parse time.)
+    pub fn check_issuer(
+        &mut self,
+        issuer: Option<&str>,
+        expected_issuer: Option<&EntityId>,
+        label: &str,
+    ) {
         let Some(expected) = expected_issuer else {
             return;
         };
-        // `direct_text`: an Issuer with element children is not an identity.
-        let issuer = find_child(self.doc, node, NS_SAML, "Issuer");
-        match issuer.map(|n| direct_text(self.doc, n)) {
-            Some(Some(ref i)) if expected == i.trim() => {}
-            Some(Some(i)) => self.error(format!(
-                "{label} Issuer mismatch: expected {expected}, got {}",
-                i.trim()
+        match issuer.map(str::trim) {
+            Some(i) if expected == i => {}
+            Some(i) => self.error(format!(
+                "{label} Issuer mismatch: expected {expected}, got {i}"
             )),
-            Some(None) => self.error(format!("{label} Issuer contains child elements")),
             None => self.error(format!("{label} has no Issuer")),
         }
     }
 
-    /// eID §7.6.1/§7.6.2: require a `Success` StatusCode on `node`, composing the
+    /// eID §7.6.1/§7.6.2: require a `Success` StatusCode, composing the
     /// second-level StatusCode and StatusMessage (§7.8) into the error so the actual
     /// reason is visible in logs. Returns the top-level status code for callers that
     /// branch on it.
-    pub fn check_status_success(&mut self, node: NodeId, label: &str) -> Option<String> {
-        let status_code = find_status_code(self.doc, node);
-        if status_code.as_deref() != Some(STATUS_SUCCESS) {
-            let second = find_nested_status_code(self.doc, node);
-            let message = find_samlp_text(self.doc, node, "StatusMessage");
+    pub fn check_status_success(&mut self, status: Option<&Status>, label: &str) -> Option<String> {
+        let status_code = status.and_then(Status::code);
+        if status_code != Some(STATUS_SUCCESS) {
             self.error(format!(
                 "{label} status: {} ({}) - {}",
-                status_code.as_deref().unwrap_or("unknown"),
-                second.map(|s| s.to_string()).unwrap_or_default(),
-                message.map(|m| m.to_string()).unwrap_or_default()
+                status_code.unwrap_or("unknown"),
+                status
+                    .and_then(Status::second_level_code)
+                    .unwrap_or_default(),
+                status
+                    .and_then(|s| s.status_message.as_deref())
+                    .unwrap_or_default()
             ));
         }
-        status_code
+        status_code.map(str::to_owned)
     }
 
     /// Bound an `@IssueInstant`/`@AuthnInstant` on both sides: reject a value older
@@ -196,124 +200,59 @@ impl<'a, 'input> Validator<'a, 'input> {
     }
 }
 
-fn find_status_code(doc: &Document, root: NodeId) -> Option<String> {
-    find_descendant(doc, root, NS_SAMLP, "StatusCode")
-        .and_then(|n| doc.get_attribute(n, "Value"))
-        .map(String::from)
-}
-
-fn find_nested_status_code(doc: &Document, root: NodeId) -> Option<String> {
-    let sc = find_descendant(doc, root, NS_SAMLP, "StatusCode")?;
-    find_child(doc, sc, NS_SAMLP, "StatusCode")
-        .and_then(|n| doc.get_attribute(n, "Value"))
-        .map(String::from)
-}
-
-/// Find a `samlp:`-namespaced descendant element's text (e.g. `StatusMessage`).
-fn find_samlp_text(doc: &Document, root: NodeId, local_name: &str) -> Option<String> {
-    find_descendant(doc, root, NS_SAMLP, local_name).and_then(|n| inner_text(doc, n))
-}
-
-/// Find a direct child element `(ns, local_name)` as a node in the parsed tree.
-///
-/// SECURITY (XML Signature Wrapping): exclusive-c14n and roxmltree both exclude
-/// comments, so a raw string scan could slice a forged element out of a comment
-/// interior that the signature digest never covered. Navigating the single
-/// parsed tree (instead of re-scanning bytes) reads exactly the element the
-/// signed, comment-excluded view sees.
-pub(super) fn child_element(
-    doc: &Document,
-    parent: NodeId,
-    ns: &str,
-    local_name: &str,
-) -> Option<NodeId> {
-    find_child(doc, parent, ns, local_name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::saml::xml_parser::parse;
-
-    fn root_of(doc: &Document) -> NodeId {
-        doc.document_element()
-    }
+    use crate::saml::constants::NS_SAMLP;
 
     /// Run `check` with a [`Validator`] over a dummy document and return the
-    /// recorded errors (the time checks never read the document).
+    /// recorded errors (the checks here never read the document).
     fn time_check_errors(check: impl FnOnce(&mut Validator)) -> Vec<String> {
-        let doc = parse(r#"<x xmlns="urn:x"/>"#).unwrap();
+        let doc = Document::parse(r#"<x xmlns="urn:x"/>"#).unwrap();
         let mut errors = Vec::new();
         check(&mut Validator::new(&doc, &mut errors));
         errors
     }
 
-    // -- child_element (parser-based, anti-XSW) --
+    // -- check_status_success --
 
-    #[test]
-    fn child_element_returns_direct_child() {
-        let xml = format!(
-            r#"<samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}"><samlp:Response ID="_r1">inner</samlp:Response></samlp:ArtifactResponse>"#
-        );
-        let doc = parse(&xml).unwrap();
-        let child = child_element(&doc, root_of(&doc), NS_SAMLP, "Response").unwrap();
-        assert_eq!(doc.get_attribute(child, "ID"), Some("_r1"));
+    fn status(xml: &str) -> Status {
+        crate::saml::xml::from_str(&format!(r#"<Status xmlns="{NS_SAMLP}">{xml}</Status>"#))
+            .expect("test Status parses")
     }
 
     #[test]
-    fn child_element_none_when_missing() {
-        let xml = format!(
-            r#"<samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}">nothing</samlp:ArtifactResponse>"#
-        );
-        let doc = parse(&xml).unwrap();
-        assert!(child_element(&doc, root_of(&doc), NS_SAMLP, "Response").is_none());
+    fn check_status_success_accepts_success() {
+        let s = status(&format!(r#"<StatusCode Value="{STATUS_SUCCESS}"/>"#));
+        let errors = time_check_errors(|v| {
+            assert_eq!(
+                v.check_status_success(Some(&s), "Test").as_deref(),
+                Some(STATUS_SUCCESS)
+            );
+        });
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
-    fn child_element_ignores_element_hidden_in_comment() {
-        // SECURITY (XSW): a forged <Response> hidden in a comment must NOT be
-        // found; the parser never materializes comment content, so the node
-        // lookup returns the genuine direct child only.
-        let xml = format!(
-            r#"<samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}"><!--<samlp:Response ID="_forged">EVIL</samlp:Response>--><samlp:Response ID="_genuine">GOOD</samlp:Response></samlp:ArtifactResponse>"#
+    fn check_status_success_reports_second_level_code_and_message() {
+        let s = status(
+            r#"<StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder"><StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:AuthnFailed"/></StatusCode><StatusMessage>Authentication cancelled</StatusMessage>"#,
         );
-        let doc = parse(&xml).unwrap();
-        let child = child_element(&doc, root_of(&doc), NS_SAMLP, "Response").unwrap();
-        assert_eq!(doc.get_attribute(child, "ID"), Some("_genuine"));
-        assert_eq!(inner_text(&doc, child).as_deref(), Some("GOOD"));
-    }
-
-    // -- find_status_code --
-
-    #[test]
-    fn find_status_code_success() {
-        let xml = format!(
-            r#"<Response xmlns="{NS_SAMLP}"><Status><StatusCode Value="{STATUS_SUCCESS}"/></Status></Response>"#
-        );
-        let doc = parse(&xml).unwrap();
-        assert_eq!(
-            find_status_code(&doc, root_of(&doc)).unwrap(),
-            STATUS_SUCCESS
-        );
+        let errors = time_check_errors(|v| {
+            v.check_status_success(Some(&s), "Test");
+        });
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("Responder"), "{errors:?}");
+        assert!(errors[0].contains("AuthnFailed"), "{errors:?}");
+        assert!(errors[0].contains("Authentication cancelled"), "{errors:?}");
     }
 
     #[test]
-    fn find_status_code_missing() {
-        let xml = format!(r#"<Response xmlns="{NS_SAMLP}"/>"#);
-        let doc = parse(&xml).unwrap();
-        assert!(find_status_code(&doc, root_of(&doc)).is_none());
-    }
-
-    // -- find_nested_status_code --
-
-    #[test]
-    fn find_nested_status_code_extracts_second_level() {
-        let xml = format!(
-            r#"<Response xmlns="{NS_SAMLP}"><Status><StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder"><StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:AuthnFailed"/></StatusCode></Status></Response>"#
-        );
-        let doc = parse(&xml).unwrap();
-        let nested = find_nested_status_code(&doc, root_of(&doc)).unwrap();
-        assert!(nested.contains("AuthnFailed"));
+    fn check_status_success_rejects_a_missing_status() {
+        let errors = time_check_errors(|v| {
+            assert!(v.check_status_success(None, "Test").is_none());
+        });
+        assert!(errors[0].contains("unknown"), "{errors:?}");
     }
 
     // -- check_not_on_or_after --
