@@ -10,7 +10,7 @@
 
 use crate::{
     error::{AuthError, Result},
-    saml::pki::subject_oin,
+    pki::subject_oin,
 };
 use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,

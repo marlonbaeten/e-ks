@@ -13,9 +13,8 @@ pub mod metadata;
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::{
-        saml::subject::SubjectId,
         state::{AuthFailure, AuthServiceState, AuthState, LoggedOutSession},
-        types::{MessageId, NameId},
+        types::{MessageId, NameId, SubjectId},
     };
     use axum::{
         extract::FromRef,

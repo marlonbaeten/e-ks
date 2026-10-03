@@ -1,11 +1,17 @@
+use gamlastan::profiles::nl_eid::NlEidError;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, AuthError>;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// A value that arrived from outside is not well-formed for its type: a
+    /// message ID that is not an XML `NCName`, an empty `NameID`, a
+    /// certificate body that is not base64.
     #[error("XML error: {0}")]
     Xml(String),
+    /// Key material could not be loaded, or the RD metadata failed its trust
+    /// checks (PKIoverheid chain, OIN, signature).
     #[error("Crypto error: {0}")]
     Crypto(String),
     #[error("HTTP error: {0}")]
@@ -14,17 +20,15 @@ pub enum AuthError {
     Config(String),
     #[error("Template error: {0}")]
     Template(String),
+    /// A SAML protocol, format or trust failure reported by gamlastan's eID
+    /// profile: the message handling this crate delegates to it.
+    #[error("SAML error: {0}")]
+    Saml(#[from] NlEidError),
 }
 
 impl From<askama::Error> for AuthError {
     fn from(e: askama::Error) -> Self {
         AuthError::Template(e.to_string())
-    }
-}
-
-impl From<crate::saml::xml_parser::XmlError> for AuthError {
-    fn from(e: crate::saml::xml_parser::XmlError) -> Self {
-        AuthError::Xml(e.to_string())
     }
 }
 
@@ -69,5 +73,13 @@ mod tests {
     fn display_config_error() {
         let err = AuthError::Config("missing var".to_string());
         assert_eq!(format!("{err}"), "Config error: missing var");
+    }
+
+    #[test]
+    fn display_saml_error_carries_the_profile_detail() {
+        let err = AuthError::from(NlEidError::MissingSignature("Assertion"));
+        let rendered = format!("{err}");
+        assert!(rendered.starts_with("SAML error: "), "{rendered}");
+        assert!(rendered.contains("Assertion"), "{rendered}");
     }
 }

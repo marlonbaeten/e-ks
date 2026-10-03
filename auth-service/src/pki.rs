@@ -10,10 +10,10 @@
 ///     PKIoverheid server certificates chain. This root is not in the Mozilla
 ///     store, so relying on system roots fails with UnknownIssuer.
 #[cfg(feature = "tvs-mock")]
-pub const BACKCHANNEL_ROOT_CA_PEM: &[u8] = include_bytes!("../../fixtures/ca.pem");
+pub const BACKCHANNEL_ROOT_CA_PEM: &[u8] = include_bytes!("../fixtures/ca.pem");
 
 #[cfg(not(feature = "tvs-mock"))]
-pub const BACKCHANNEL_ROOT_CA_PEM: &[u8] = include_bytes!("../../pkioverheid_private_root_g1.pem");
+pub const BACKCHANNEL_ROOT_CA_PEM: &[u8] = include_bytes!("../pkioverheid_private_root_g1.pem");
 
 /// Trust anchor(s) the RD **metadata signing certificate** must chain to
 /// (eID §9.1/§9.2). The signing cert in the RD metadata is validated against
@@ -41,8 +41,8 @@ pub const RD_METADATA_INTERMEDIATES: &[&[u8]] = &[];
 
 #[cfg(not(feature = "tvs-mock"))]
 pub const RD_METADATA_INTERMEDIATES: &[&[u8]] = &[
-    include_bytes!("../../staat_private_services_ca_g1.pem"),
-    include_bytes!("../../pkioverheid_private_services_ca_2023.pem"),
+    include_bytes!("../staat_private_services_ca_g1.pem"),
+    include_bytes!("../pkioverheid_private_services_ca_2023.pem"),
 ];
 
 /// The `Subject.serialNumber` (OID 2.5.4.5) of a DER certificate, if present.

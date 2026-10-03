@@ -3,7 +3,6 @@ use crate::{
     config::{AuthConfig, Environment},
     error::Result,
     keys::KeySet,
-    saml::messages::{AuthnRequestSpec, CreatedMessage, create_authn_request},
     state::{AuthFailure, AuthServiceState, AuthState},
     types::{EndpointUrl, MessageId},
 };
@@ -13,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::CookieJar;
+use gamlastan::profiles::nl_eid::{AcsTarget, NlEidAuthnOptions, signed_authn_request};
 use tracing::{debug, error, info, warn};
 
 /// Initiate SAML authentication per eID §7.1 step 2 / §3.1.1.
@@ -70,8 +70,8 @@ fn build_login_response(
     headers: &HeaderMap,
 ) -> Result<(MessageId, Response)> {
     let config = auth_state.auth_config();
-    let msg = signed_authn_request(config, auth_state.dv_keys(), sso_url)?;
-    info!("[login] AuthnRequest created: {}", msg.id.log_prefix());
+    let (request_id, xml) = create_authn_request(config, auth_state.dv_keys(), sso_url)?;
+    info!("[login] AuthnRequest created: {}", request_id.log_prefix());
 
     // Bind this SSO flow to the current browser (login-CSRF / forced-login
     // defense): the matching ACS callback must present this cookie, whose
@@ -80,72 +80,83 @@ fn build_login_response(
     // make a victim's browser complete a flow the attacker started.
     let jar = jar.add(crate::handlers::flow::flow_cookie(
         &config.dv.acs_url,
-        &msg.id,
+        &request_id,
         headers,
     ));
 
     debug!("[login] Returning HTTP-POST autosubmit form");
-    let resp = autosubmit_post_response(sso_url, &msg.xml, "SAMLRequest")?;
-    Ok((msg.id, (jar, resp).into_response()))
+    let resp = autosubmit_post_response(sso_url, &xml, "SAMLRequest")?;
+    Ok((request_id, (jar, resp).into_response()))
 }
 
-/// Create the signed AuthnRequest (eID §7.3) for the RD's SSO endpoint.
-fn signed_authn_request(
+/// Create the signed AuthnRequest (eID §7.3) for the RD's SSO endpoint:
+/// `ForceAuthn`, the `IntendedAudience` / `ServiceUUID` extension, a
+/// `RequestedAuthnContext Comparison="minimum"` for the DV's minimum LoA, and
+/// (optionally) a `Scoping/IDPList` pre-selecting a single AD.
+fn create_authn_request(
     config: &AuthConfig,
     keys: &KeySet,
     sso_url: &EndpointUrl,
-) -> Result<CreatedMessage> {
+) -> Result<(MessageId, String)> {
     let preselected_ad_entity_id = config.preselected_ad_entity_id();
 
-    // In the Test environment the IdP is the standalone TVS mock, which resolves
-    // the SP callback from the request. The real TVS forbids this (eID §7.3) and
-    // resolves the ACS from the registered metadata via the index, so we only
-    // send the URL for Test, letting one shared mock serve many ephemeral test
-    // environments without per-environment registration.
-    let request_acs_url = (config.environment == Environment::Test).then_some(&config.dv.acs_url);
+    // The ACS is referenced by its metadata index (eID §7.3). In the Test
+    // environment the IdP is the standalone TVS mock, which resolves the SP
+    // callback from the request itself, so only there the URL is sent, letting
+    // one shared mock serve many ephemeral test environments without
+    // per-environment registration.
+    let mut opts = NlEidAuthnOptions::to(sso_url.as_str(), 0);
+    if config.environment == Environment::Test {
+        opts.acs = AcsTarget::Url(config.dv.acs_url.as_str().to_owned());
+    }
+    if let Some(ad) = &preselected_ad_entity_id {
+        opts.preselected_providers = vec![ad.as_str().to_owned()];
+    }
 
     debug!(
-        "[login] entity_id={}, service_uuid={}, sso_url={}, preselected_ad={:?} ({:?}), request_acs_url={:?}, signing_keys={}",
+        "[login] entity_id={}, service_uuid={}, sso_url={}, preselected_ad={:?} ({:?}), acs={:?}, signing_keys={}",
         config.dv.entity_id,
         config.dv.service_uuid,
         sso_url,
         config.preselected_ad,
         preselected_ad_entity_id,
-        request_acs_url,
+        opts.acs,
         keys.signing.len(),
     );
 
-    create_authn_request(&AuthnRequestSpec {
-        entity_id: &config.dv.entity_id,
-        service_uuid: &config.dv.service_uuid,
-        sso_url,
-        signing_key: keys.primary_signing()?,
-        preselected_ad_entity_id: preselected_ad_entity_id.as_ref(),
-        acs_url: request_acs_url,
-    })
+    let signing_key = keys.primary_signing()?;
+    let signed = signed_authn_request(
+        &config.nl_eid(),
+        &opts,
+        &signing_key.signer()?,
+        signing_key.cert_base64.as_str(),
+    )?;
+    Ok((MessageId::parse(signed.id)?, signed.xml))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        config::AuthConfig,
+        config::{AuthConfig, PreselectedAd},
         handlers::test_support::MockAuthState,
-        saml::idp_metadata::IdpMetadata,
+        rd_metadata::IdpMetadata,
         types::{EntityId, ServiceUuid},
     };
     use axum::{
         body::to_bytes,
         http::{StatusCode, header},
     };
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
     fn fixtures_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
     }
 
-    async fn state_with_rd() -> AuthServiceState {
+    async fn state_with_rd(environment: Environment) -> AuthServiceState {
         let mut cfg = AuthConfig::default().with_certs_dir(fixtures_dir());
-        cfg.environment = Environment::Test;
+        cfg.environment = environment;
+        cfg.preselected_ad = PreselectedAd::DigiD;
         cfg.dv.entity_id = EntityId::from_static("urn:test:dv");
         cfg.dv.service_uuid = ServiceUuid::from_static("f847dc11-ac24-47b2-84a8-a057440ce56d");
         cfg.dv.acs_url = EndpointUrl::from_base_url("https://dv.example.com/saml/sp/acs", "ACS")
@@ -173,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_builds_signed_authn_request_autosubmit_form() {
-        let mock = MockAuthState::new(state_with_rd().await);
+        let mock = MockAuthState::new(state_with_rd(Environment::Test).await);
         let resp = handle_login(
             State(mock.clone()),
             State(mock.auth.clone()),
@@ -201,5 +212,59 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"name="SAMLRequest""#));
+    }
+
+    /// The signed request a login emits, decoded from the autosubmit form.
+    async fn emitted_authn_request(environment: Environment) -> (AuthServiceState, String) {
+        let auth = state_with_rd(environment).await;
+        let rd = auth.rd_metadata().unwrap();
+        let (id, xml) = create_authn_request(auth.auth_config(), auth.dv_keys(), &rd.sso_url)
+            .expect("AuthnRequest builds and signs");
+        assert!(xml.contains(&format!(r#"ID="{id}""#)), "{xml}");
+        // Round-trips through the form the browser submits.
+        let form =
+            crate::bindings::http_post::create_post_form(&rd.sso_url, &xml, "SAMLRequest").unwrap();
+        assert!(form.contains(&BASE64.encode(xml.as_bytes())));
+        (auth, xml)
+    }
+
+    #[tokio::test]
+    async fn the_authn_request_carries_the_eid_extension_and_verifies() {
+        let (auth, xml) = emitted_authn_request(Environment::Test).await;
+        assert!(xml.contains("urn:nl-eid-gdi:1.0:IntendedAudience"), "{xml}");
+        assert!(xml.contains("urn:nl-eid-gdi:1.0:ServiceUUID"), "{xml}");
+        assert!(xml.contains("f847dc11-ac24-47b2-84a8-a057440ce56d"));
+        assert!(xml.contains(r#"ForceAuthn="true""#));
+        assert!(xml.contains(r#"Comparison="minimum""#));
+        // The pre-selected AD (pre-production index outside production).
+        assert!(
+            xml.contains("urn:nl-eid-gdi:1.0:AD:00000004166909913000:entities:9002"),
+            "{xml}"
+        );
+        // Test environment: the ACS URL travels in the request.
+        assert!(
+            xml.contains(r#"AssertionConsumerServiceURL="https://dv.example.com/saml/sp/acs""#),
+            "{xml}"
+        );
+
+        // Signed by the DV's primary signing key.
+        let primary = auth.dv_keys().primary_signing().unwrap();
+        let verifier = IdpMetadata::for_tests_trusting(&[&primary.cert_pem]);
+        let result = verifier
+            .verifier()
+            .verify_enveloped(&xml)
+            .expect("verifier runs");
+        assert!(result.is_valid(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn outside_the_test_environment_the_acs_is_referenced_by_index() {
+        // The real TVS forbids an ACS URL in the request (eID §7.3).
+        let (_, xml) = emitted_authn_request(Environment::Preproduction).await;
+        assert!(!xml.contains("AssertionConsumerServiceURL"), "{xml}");
+        assert!(
+            xml.contains(r#"AssertionConsumerServiceIndex="0""#),
+            "{xml}"
+        );
     }
 }

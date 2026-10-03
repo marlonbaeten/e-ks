@@ -18,6 +18,8 @@
 
 use std::{borrow::Cow, fmt};
 
+use secrecy::SecretString;
+
 use crate::error::{AuthError, Result};
 
 /// Characters that must never reach an interpolation site.
@@ -501,9 +503,47 @@ impl fmt::Display for Artifact {
     }
 }
 
+/// A decrypted eID SubjectID (eID §7.6.3.4): the identifier plus the qualifier
+/// saying which kind of identifier it is.
+///
+/// Produced by the ACS handler from gamlastan's validated outcome and passed to
+/// [`AuthState::on_authenticated`](crate::AuthState::on_authenticated).
+#[derive(Debug, Clone)]
+pub struct SubjectId {
+    /// The subject identifier (BSN / pseudonym, PII). Wrapped so it never
+    /// reaches `Debug`/logs and is zeroized on drop; call `.expose_secret()`
+    /// to read it.
+    pub value: SecretString,
+    /// `@NameQualifier`: the eID identifier type, e.g.
+    /// `urn:nl-eid-gdi:1.0:id:legacy-BSN` or `...:id:Pseudonym` (eID §7.6.3.4.4).
+    pub name_qualifier: String,
+}
+
+impl SubjectId {
+    /// Copy a decrypted identifier out of gamlastan's zeroizing value into the
+    /// `SecretString` the embedding application works with.
+    pub(crate) fn from_eid(subject: &gamlastan::profiles::nl_eid::SubjectId) -> Self {
+        Self {
+            value: SecretString::from(subject.expose_value().to_owned()),
+            name_qualifier: subject.identifier_type().as_uri().to_owned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subject_id_is_never_revealed_by_debug() {
+        let subject = SubjectId {
+            value: SecretString::from("900070341".to_string()),
+            name_qualifier: "urn:nl-eid-gdi:1.0:id:legacy-BSN".to_string(),
+        };
+        let rendered = format!("{subject:?}");
+        assert!(!rendered.contains("900070341"), "{rendered}");
+        assert!(rendered.contains("legacy-BSN"));
+    }
 
     #[test]
     fn entity_id_rejects_injection_shaped_values() {

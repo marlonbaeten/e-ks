@@ -3,9 +3,11 @@ use crate::{
     error::{AuthError, Result},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use gamlastan::{
+    crypto::{KeyUsage, KeysManager, SamlSigner, keys::loader},
+    profiles::nl_eid::{DvDecryptionKeys, PublishedCertificate, key_name_for_certificate},
+};
 use secrecy::{ExposeSecret, SecretString};
-use sha1::{Digest, Sha1};
-use sha2::Sha256;
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -32,7 +34,8 @@ const PEM_CERT_END: &str = "-----END CERTIFICATE-----";
 /// Wraps [`SecretString`], so the key never reaches `Debug` or a log line and is
 /// zeroized on drop. `expose_pem` is the single exit point and is
 /// crate-private: the key text cannot be extracted by an embedding application,
-/// only handed to [`crate::saml::crypto`].
+/// only loaded into a gamlastan signer or decryptor ([`KeyPair::signer`],
+/// [`KeySet::decryption_keys`]).
 #[derive(Clone)]
 pub struct PrivateKeyPem(SecretString);
 
@@ -108,23 +111,8 @@ impl CertificatePem {
     /// `KeyDescriptor`s and in the signature over its metadata). Used purely as a
     /// lookup key to match a signature's `KeyInfo` against a cert from verified
     /// metadata; not a security primitive, so SHA-1 here is not a weakness.
-    ///
     pub fn key_name(&self) -> KeyName {
-        KeyName::from_digest(&Sha1::digest(self.to_der()))
-    }
-
-    /// Every `<ds:KeyName>` form a peer might use to reference this certificate:
-    /// the SHA-1 thumbprint (TVS RD convention) and the SHA-256 thumbprint (DigiD
-    /// AD convention). Used by [`KeyPair::matches_key_name`] to look a
-    /// signature's `KeyInfo` up against a cert from verified metadata regardless
-    /// of which thumbprint algorithm the signer chose (eID SAML: "KeyName MAY be
-    /// any string").
-    pub fn key_names(&self) -> [KeyName; 2] {
-        let der = self.to_der();
-        [
-            KeyName::from_digest(&Sha1::digest(&der)),
-            KeyName::from_digest(&Sha256::digest(&der)),
-        ]
+        KeyName(key_name_for_certificate(&self.to_der()))
     }
 }
 
@@ -188,8 +176,7 @@ impl fmt::Display for CertificateBase64 {
 /// A `<ds:KeyName>`: the lowercase-hex thumbprint of a DER certificate.
 ///
 /// Used purely as a lookup key, to match a signature's `KeyInfo` against a
-/// certificate from verified metadata (see [`KeyPair::matches_key_name`]); trust
-/// never rests on it.
+/// certificate from verified metadata; trust never rests on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyName(String);
 
@@ -204,10 +191,6 @@ impl KeyName {
             )));
         }
         Ok(Self(s.to_ascii_lowercase()))
-    }
-
-    fn from_digest(bytes: &[u8]) -> Self {
-        Self(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     pub fn as_str(&self) -> &str {
@@ -267,46 +250,37 @@ impl KeyPair {
         }
     }
 
-    /// Whether a signature's `<ds:KeyName>` identifies this certificate.
+    /// A gamlastan signer over this pair's private key, for the enveloped
+    /// signatures on outgoing messages and the DV metadata.
     ///
-    /// The eID §7.6 message tables require a `<KeyInfo>` with a `<KeyName>` (or
-    /// `<X509Certificate>`) but do not fix the KeyName format. The TVS
-    /// Routeringsdienst references its certs by their SHA-1 thumbprint; the
-    /// DigiD Authenticatiedienst signs the Assertion referencing the same kind
-    /// of cert by its **SHA-256** thumbprint. Both forms identify the cert from
-    /// verified metadata (a lookup key, not a security primitive), so accept
-    /// either thumbprint algorithm.
-    pub fn matches_key_name(&self, candidate: &str) -> bool {
-        let Ok(candidate) = KeyName::parse(candidate) else {
-            return false;
-        };
-        self.key_name == candidate || self.cert_pem.key_names().contains(&candidate)
+    /// Fails for a public-only certificate ([`PrivateKeyPem::absent`]) or a
+    /// private key the crypto backend cannot load.
+    pub fn signer(&self) -> Result<SamlSigner> {
+        if !self.key_pem.is_present() {
+            return Err(AuthError::Config(format!(
+                "certificate {} has no private key to sign with",
+                self.key_name
+            )));
+        }
+        // SECURITY: the key text goes to the backend only; the error carries the
+        // backend's reason, never the PEM.
+        let mut key =
+            loader::load_pem_auto(self.key_pem.expose_pem().as_bytes(), None).map_err(|e| {
+                AuthError::Crypto(format!("Failed to load signing key {}: {e}", self.key_name))
+            })?;
+        key.usage = KeyUsage::Sign;
+        let mut keys = KeysManager::new();
+        keys.add_key(key);
+        Ok(SamlSigner::new(keys))
     }
-}
 
-/// A DV private key offered for `EncryptedID` decryption, with the `KeyName` it
-/// is advertised under in the DV metadata.
-///
-/// A named struct rather than a `(&str, &str)` pair: two adjacent strings are
-/// trivially swappable at a call site, and one of them is a private key.
-#[derive(Debug, Clone, Copy)]
-pub struct DecryptionKey<'a> {
-    pub key_pem: &'a PrivateKeyPem,
-    /// Diagnostics only: the crypto backend unwraps the `EncryptedKey` with the
-    /// private key itself, never by matching this name.
-    pub key_name: &'a KeyName,
-}
-
-impl<'a> DecryptionKey<'a> {
-    /// The decryption keys of a [`KeySet`], in configured order.
-    pub fn from_key_set(keys: &'a KeySet) -> Vec<Self> {
-        keys.encryption
-            .iter()
-            .map(|k| Self {
-                key_pem: &k.key_pem,
-                key_name: &k.key_name,
-            })
-            .collect()
+    /// This certificate as it is published in a `<md:KeyDescriptor>`: its
+    /// `KeyName` and base64 DER.
+    pub fn published(&self) -> PublishedCertificate {
+        PublishedCertificate {
+            key_name: self.key_name.as_str().to_owned(),
+            cert_der_b64: self.cert_base64.as_str().to_owned(),
+        }
     }
 }
 
@@ -329,6 +303,23 @@ impl KeySet {
         self.signing.first().ok_or_else(|| {
             AuthError::Config("no DV signing key is configured (check CERTS_DIR)".to_string())
         })
+    }
+
+    /// The DV's decryption keys for `EncryptedID` values, in configured order
+    /// (gamlastan tries each, so a blob wrapped to a rotated key still
+    /// decrypts, eID §7.6.3.4.4).
+    pub fn decryption_keys(&self) -> Result<DvDecryptionKeys> {
+        if self.encryption.is_empty() {
+            return Err(AuthError::Config(
+                "no DV encryption key is configured (check CERTS_DIR)".to_string(),
+            ));
+        }
+        // SECURITY: the key text goes to the backend only.
+        Ok(DvDecryptionKeys::from_private_key_pems(
+            self.encryption
+                .iter()
+                .map(|k| k.key_pem.expose_pem().as_bytes()),
+        )?)
     }
 }
 
@@ -550,18 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn key_names_yields_sha1_and_sha256() {
-        let names = fake_cert().key_names();
-        assert_eq!(names[0].as_str().len(), 40, "first is SHA-1 (40 hex chars)");
-        assert_eq!(
-            names[1].as_str().len(),
-            64,
-            "second is SHA-256 (64 hex chars)"
-        );
-        assert_eq!(names[0], fake_cert().key_name());
-    }
-
-    #[test]
     fn key_name_parse_normalises_case_and_whitespace() {
         let upper = KeyName::parse("  DEADBEEF  ").unwrap();
         assert_eq!(upper.as_str(), "deadbeef");
@@ -579,38 +558,22 @@ mod tests {
     }
 
     #[test]
-    fn matches_key_name_accepts_sha1_thumbprint() {
-        let kp = fake_key_pair();
-        assert!(kp.matches_key_name(fake_cert().key_names()[0].as_str()));
-    }
-
-    #[test]
-    fn matches_key_name_accepts_sha256_thumbprint() {
-        // The DigiD AD references its signing cert by SHA-256 thumbprint, not
-        // the SHA-1 form stored in `key_name`; both must match.
-        let kp = fake_key_pair();
-        let sha256 = fake_cert().key_names()[1].clone();
-        assert_ne!(sha256, kp.key_name);
-        assert!(kp.matches_key_name(sha256.as_str()));
+    fn public_only_key_pair_cannot_sign() {
+        let err = fake_key_pair()
+            .signer()
+            .err()
+            .expect("a public-only pair cannot sign");
         assert!(
-            kp.matches_key_name(&format!("  {}  ", sha256.as_str().to_uppercase())),
-            "trims and case-folds input"
+            matches!(&err, AuthError::Config(m) if m.contains("no private key")),
+            "{err:?}"
         );
     }
 
     #[test]
-    fn matches_key_name_rejects_unknown() {
-        let kp = fake_key_pair();
-        assert!(!kp.matches_key_name("deadbeef"));
-    }
-
-    #[test]
-    fn matches_key_name_rejects_malformed_candidate() {
-        // A `<ds:KeyName>` that is not a thumbprint at all never matches, and
-        // never panics.
-        let kp = fake_key_pair();
-        assert!(!kp.matches_key_name(""));
-        assert!(!kp.matches_key_name("<script>"));
+    fn published_certificate_carries_key_name_and_der() {
+        let published = fake_key_pair().published();
+        assert_eq!(published.key_name, fake_cert().key_name().as_str());
+        assert_eq!(published.cert_der_b64, fake_cert().to_base64().as_str());
     }
 
     #[test]
@@ -733,6 +696,22 @@ mod tests {
         assert_eq!(primary.key_name.as_str().len(), 40);
         assert!(!primary.cert_base64.as_str().is_empty());
         assert!(primary.key_pem.is_present());
+        // The private key loads into a signer.
+        assert!(primary.signer().is_ok());
+        // No encryption pair loaded: no decryption keys.
+        assert!(set.decryption_keys().is_err());
+    }
+
+    #[tokio::test]
+    async fn load_key_set_loads_decryption_keys() {
+        let paths = key_pair_paths(&fixtures_dir(), "dv-encryption-1");
+        let set = load_key_set(
+            std::slice::from_ref(&key_pair_paths(&fixtures_dir(), "dv-signing-1")),
+            std::slice::from_ref(&paths),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set.decryption_keys().unwrap().len(), 1);
     }
 
     #[tokio::test]

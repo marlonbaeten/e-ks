@@ -43,7 +43,7 @@ macro_rules! embedded_fixtures {
 const FIXTURES: &[(&str, &[u8])] = embedded_fixtures![
     // mTLS client identity for the back-channel. (The test CA pinned for the
     // back-channel *server* is embedded separately and not read from a path;
-    // see [`crate::saml::pki::BACKCHANNEL_ROOT_CA_PEM`].)
+    // see [`crate::pki::BACKCHANNEL_ROOT_CA_PEM`].)
     "dv-tls.pem",
     "dv-tls-key.pem",
     // DV SAML signing keys (the second pair is optional, for rollover).

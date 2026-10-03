@@ -129,7 +129,10 @@ workspace-level dependency list.
 - **`auth-service/`**: a small, application-agnostic crate providing the
   `/login` and `/logout` routes and an `AuthState` trait. The `eks` crate
   implements `AuthState` for its `AppState` and mounts this router; the crate
-  itself knows nothing about e-KS domain types.
+  itself knows nothing about e-KS domain types. The SAML protocol (eID SAML
+  v4.4) is gamlastan's `profiles::nl_eid`; this crate keeps only the handlers,
+  key management, the mTLS back-channel and the trust checks on the RD
+  metadata.
 - **`development/`** (`eks-development`): a sibling crate that is *not* a
   dependency of `eks`. It ships local-only tooling: the `dev` orchestrator
   that brings up Docker dependencies and runs the app, the `setup` binary,

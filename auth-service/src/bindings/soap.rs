@@ -1,14 +1,11 @@
 //! SAML SOAP binding: the mTLS back-channel used for artifact resolution
 //! (eID §7.5, §9.4). The TLS side (pinned root, RD OIN check, client identity)
-//! lives in [`super::mtls`].
+//! lives in [`super::mtls`]; the SOAP envelope itself is gamlastan's
+//! (`gamlastan::bindings::soap`), this module only moves the bytes.
 
 use crate::{
     config::TlsConfig,
     error::{AuthError, Result},
-    saml::{
-        constants::NS_SOAP,
-        xml_parser::{Document, NodeId, find_descendant},
-    },
     types::EndpointUrl,
 };
 use std::{
@@ -95,7 +92,7 @@ async fn build_mtls_client(tls: &TlsConfig) -> Result<reqwest::Client> {
         .map_err(|e| AuthError::Http(format!("Failed to read TLS client key: {e}")))?;
 
     let config = super::mtls::client_config(
-        crate::saml::pki::BACKCHANNEL_ROOT_CA_PEM,
+        crate::pki::BACKCHANNEL_ROOT_CA_PEM,
         crate::config::RD_OIN,
         &cert_pem,
         &key_pem,
@@ -177,63 +174,9 @@ pub async fn send_soap_request(
     Ok(body)
 }
 
-/// Locate the first child element of the SOAP `<Body>` (the ArtifactResponse)
-/// as a node in the already-parsed document.
-///
-/// The Body is matched by `(SOAP-envelope namespace, "Body")`, so any prefix
-/// bound to the SOAP 1.1 envelope namespace works, not just `soapenv:`. Returns
-/// the node so the caller navigates the single parsed tree (no re-parse).
-pub fn unwrap_soap(doc: &Document, root: NodeId) -> Option<NodeId> {
-    let body = find_descendant(doc, root, NS_SOAP, "Body")?;
-    doc.first_element_child(body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::saml::{constants::NS_SAMLP, xml_parser::parse};
-
-    fn root_of(doc: &Document) -> NodeId {
-        doc.document_element()
-    }
-
-    #[test]
-    fn unwrap_soap_extracts_body() {
-        let xml = format!(
-            r#"<soapenv:Envelope xmlns:soapenv="{NS_SOAP}"><soapenv:Body><samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}" ID="_1">content</samlp:ArtifactResponse></soapenv:Body></soapenv:Envelope>"#
-        );
-        let doc = parse(&xml).unwrap();
-        let body_child = unwrap_soap(&doc, root_of(&doc)).unwrap();
-        assert_eq!(doc.local_name(body_child), Some("ArtifactResponse"));
-    }
-
-    #[test]
-    fn unwrap_soap_works_for_any_soap_prefix() {
-        // Namespace-aware: any prefix bound to the SOAP envelope namespace works,
-        // not just the literal `soapenv:` prefix.
-        let xml = format!(
-            r#"<SOAP-ENV:Envelope xmlns:SOAP-ENV="{NS_SOAP}"><SOAP-ENV:Body><samlp:ArtifactResponse xmlns:samlp="{NS_SAMLP}">x</samlp:ArtifactResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#
-        );
-        let doc = parse(&xml).unwrap();
-        let body_child = unwrap_soap(&doc, root_of(&doc)).unwrap();
-        assert_eq!(doc.local_name(body_child), Some("ArtifactResponse"));
-    }
-
-    #[test]
-    fn unwrap_soap_returns_none_when_not_soap() {
-        let doc = parse(r#"<not-soap xmlns="urn:x">bad</not-soap>"#).unwrap();
-        assert!(unwrap_soap(&doc, root_of(&doc)).is_none());
-    }
-
-    #[test]
-    fn unwrap_soap_returns_none_for_empty_body() {
-        let xml = format!(
-            r#"<soapenv:Envelope xmlns:soapenv="{NS_SOAP}"><soapenv:Body>   </soapenv:Body></soapenv:Envelope>"#
-        );
-        let doc = parse(&xml).unwrap();
-        assert!(unwrap_soap(&doc, root_of(&doc)).is_none());
-    }
 
     fn fixture_tls() -> TlsConfig {
         let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures"));

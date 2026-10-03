@@ -14,7 +14,7 @@ use std::{
 use tracing::{debug, error, warn};
 
 use super::Inner;
-use crate::saml::idp_metadata::{
+use crate::rd_metadata::{
     IdpMetadata, RdTrust, fetch_and_cache_idp_metadata, load_cached_idp_metadata,
 };
 
@@ -30,7 +30,7 @@ pub(super) fn spawn(inner: &Arc<Inner>) {
 /// a descriptor is loaded: the RD metadata is re-fetched at least every 24h, and
 /// sooner when its `cacheDuration` (eID §8.5) indicates a shorter window (see
 /// [`next_refresh_interval`]). The hard `validUntil` expiry is enforced
-/// separately at parse time (`saml::idp_metadata`).
+/// separately at parse time (`rd_metadata`).
 const MAX_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Floor on the computed refresh interval, so a very small (or buggy)
@@ -156,7 +156,7 @@ async fn refresh_rd_metadata(inner: &Inner) {
             debug!(
                 "[metadata] Refreshed RD metadata: entity_id={}, signing_keys={}",
                 metadata.entity_id,
-                metadata.signing_keys.len()
+                metadata.signing_key_names.len()
             );
             *inner.rd_metadata.write() = Some(Arc::new(metadata));
         }

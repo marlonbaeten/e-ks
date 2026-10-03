@@ -11,7 +11,6 @@ pub(crate) use sls::handle_sls;
 use crate::{
     bindings::http_post::autosubmit_post_response,
     error::Result,
-    saml::messages::create_logout_request,
     state::{AuthServiceState, AuthState, LoggedOutSession},
     types::{EndpointUrl, MessageId, NameId, RedirectTarget},
 };
@@ -20,6 +19,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::CookieJar;
+use gamlastan::profiles::nl_eid::signed_logout_request;
 use tracing::{debug, error, info, warn};
 
 /// SP-initiated logout per eID §7.7.1 / §3.1.1.1, mounted by the embedding
@@ -96,16 +96,22 @@ fn build_slo_form(
         "[logout] Building LogoutRequest: entity_id={}, slo_url={}",
         cfg.dv.entity_id, slo_url
     );
-    let msg = create_logout_request(
-        name_id,
-        &cfg.dv.entity_id,
-        slo_url,
-        auth_state.dv_keys().primary_signing()?,
+    let signing_key = auth_state.dv_keys().primary_signing()?;
+    let msg = signed_logout_request(
+        &cfg.nl_eid(),
+        name_id.as_str(),
+        slo_url.as_str(),
+        &signing_key.signer()?,
+        signing_key.cert_base64.as_str(),
     )?;
-    info!("[logout] LogoutRequest created: {}", msg.id.log_prefix());
+    let request_id = MessageId::parse(msg.id)?;
+    info!(
+        "[logout] LogoutRequest created: {}",
+        request_id.log_prefix()
+    );
     debug!("[logout] LogoutRequest XML built; returning autosubmit form");
     let form = autosubmit_post_response(slo_url, &msg.xml, "SAMLRequest")?;
-    Ok((msg.id, form))
+    Ok((request_id, form))
 }
 
 #[cfg(test)]

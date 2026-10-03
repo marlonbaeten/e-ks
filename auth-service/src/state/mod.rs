@@ -4,14 +4,12 @@ use crate::{
     config::AuthConfig,
     error::{AuthError, Result},
     keys::{KeyPair, KeySet, load_key_set, load_metadata_tls_cert},
-    saml::{
-        idp_metadata::{IdpMetadata, RdTrust},
-        subject::SubjectId,
-    },
-    types::{MessageId, NameId},
+    rd_metadata::{IdpMetadata, RdTrust},
+    types::{MessageId, NameId, SubjectId},
 };
 use axum::{http::HeaderMap, response::Response};
 use axum_extra::extract::CookieJar;
+use gamlastan::security::replay::InMemoryReplayCache;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use tracing::debug;
@@ -55,6 +53,11 @@ pub(super) struct Inner {
     pub(super) rd_metadata: RwLock<Option<Arc<IdpMetadata>>>,
     /// Cached signed SP metadata XML, once built.
     cached_metadata: Mutex<Option<String>>,
+    /// Assertion-ID replay cache gamlastan consults (eID §9.7). Process-local;
+    /// across instances the consume-once pending-request store of the
+    /// embedding application is what blocks a replay, this is defense in depth
+    /// within one instance.
+    replay_cache: InMemoryReplayCache,
 }
 
 impl AuthServiceState {
@@ -63,7 +66,7 @@ impl AuthServiceState {
     /// the RD entity ID, endpoints, and signing/encryption certs (eID §9.2).
     ///
     /// On a failed fetch the on-disk cache from a previous run is used as a
-    /// fallback (see [`crate::saml::idp_metadata::load_cached_idp_metadata`]). If
+    /// fallback (see [`crate::rd_metadata::load_cached_idp_metadata`]). If
     /// there is no cache either,
     /// the state boots without a descriptor: the SAML flow reports itself
     /// unavailable until the background refresh fetches one (see
@@ -116,6 +119,7 @@ impl AuthServiceState {
                 metadata_tls_cert,
                 rd_metadata: RwLock::new(rd_metadata.map(Arc::new)),
                 cached_metadata: Mutex::new(None),
+                replay_cache: InMemoryReplayCache::new(),
             }),
         }
     }
@@ -170,6 +174,10 @@ impl AuthServiceState {
 
     pub(crate) fn cached_metadata(&self) -> Option<String> {
         self.inner.cached_metadata.lock().clone()
+    }
+
+    pub(crate) fn replay_cache(&self) -> &InMemoryReplayCache {
+        &self.inner.replay_cache
     }
 
     pub(crate) fn set_cached_metadata(&self, xml: String) {
@@ -325,7 +333,8 @@ pub enum AuthFailure {
 /// failure path funnels through [`AuthState::on_authentication_failed`] and the
 /// embedding application renders its own error page instead of a bare status
 /// code. Transport errors ([`AuthError::Http`]) are transient (`Unavailable`);
-/// everything else (signing, templating, bad metadata/config) is `Error`.
+/// everything else (signing, templating, bad metadata/config, a SAML protocol
+/// failure) is `Error`.
 impl From<&AuthError> for AuthFailure {
     fn from(e: &AuthError) -> Self {
         match e {
@@ -333,7 +342,8 @@ impl From<&AuthError> for AuthFailure {
             AuthError::Xml(_)
             | AuthError::Crypto(_)
             | AuthError::Config(_)
-            | AuthError::Template(_) => AuthFailure::Error,
+            | AuthError::Template(_)
+            | AuthError::Saml(_) => AuthFailure::Error,
         }
     }
 }

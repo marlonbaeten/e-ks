@@ -1,52 +1,58 @@
 //! SAML 2.0 Service Provider for the Dutch TVS *Routeringsdienst*.
 //!
-//! This crate implements the **DV (Dienstverlener / Service Provider)** side of
-//! the *Koppelvlakspecificatie eID SAML v4.4* interface, talking to the TVS RD
-//! (the IdP). A non-authoritative extract of the requirements this code targets
-//! lives in `eid-saml-4.4-requirements.md` next to this crate; `§` references in
-//! the source point at it (and, where noted, at the OASIS `saml-*-2.0-os` specs
+//! This crate is the **DV (Dienstverlener / Service Provider)** side of the
+//! *Koppelvlakspecificatie eID SAML v4.4* interface, talking to the TVS RD
+//! (the IdP). A non-authoritative extract of the requirements lives in
+//! `eid-saml-4.4-requirements.md` next to this crate; `§` references in the
+//! source point at it (and, where noted, at the OASIS `saml-*-2.0-os` specs
 //! and the TVS "Checklist Testen").
 //!
-//! # What it does
+//! # What lives where
 //!
-//! It is consumed by an embedding application, which mounts [`router`] (the
-//! protocol endpoints) plus [`handle_login`]/[`handle_logout`] on login/logout
-//! routes of its own choosing:
+//! The SAML protocol itself (message construction and signing, SOAP wrapping,
+//! signature verification bound to the consumed element, the §7.6 processing
+//! rules, Level-of-Assurance and `ServiceUUID` binding, `EncryptedID`
+//! decryption, the DV metadata document and the RD metadata reader) is
+//! [`gamlastan::profiles::nl_eid`]. This crate contains only what a deployment
+//! adds around it:
 //!
-//! - `/login` (embedder-mounted [`handle_login`]): start SSO: build a signed
-//!   AuthnRequest (§7.3) and auto-POST it to the RD SSO endpoint (HTTP-POST
-//!   binding, §3.1.1).
+//! - the axum **handlers** ([`handlers`]) and the [`AuthState`] contract with
+//!   the embedding application;
+//! - **key management** ([`keys`]): the DV cert/key bundle on disk, loaded into
+//!   gamlastan signers and decryptors;
+//! - the **mTLS SOAP back-channel** ([`bindings::soap`], [`bindings::mtls`]):
+//!   pinned PKIoverheid root, RD OIN check on the server certificate, client
+//!   identity (§9.4);
+//! - **trust in the RD metadata** ([`rd_metadata`]): the pinned RD `entityID`,
+//!   the PKIoverheid chain and OIN of its signing certificates, the endpoint
+//!   domain pin, the on-disk cache and the background refresh (§8.5, §9.1,
+//!   §9.2);
+//! - the browser-side **flow binding** ([`handlers::flow`]) and the
+//!   **pending-request store** ([`pending`]) that consume each request ID once
+//!   (§9.7);
+//! - the HTTP-POST binding page and its CSP ([`bindings::http_post`], [`csp`]),
+//!   and the deployment [`config`].
+//!
+//! # Endpoints
+//!
+//! An embedding application mounts [`router`] (the protocol endpoints) plus
+//! [`handle_login`] / [`handle_logout`] on login and logout routes of its own
+//! choosing:
+//!
+//! - `/login` (embedder-mounted [`handle_login`]): start SSO: a signed
+//!   AuthnRequest (§7.3), auto-POSTed to the RD SSO endpoint (§3.1.1).
 //! - `GET  /saml/sp/acs`: Assertion Consumer Service: receive the artifact
-//!   (§7.4), resolve it over the mTLS SOAP back-channel (§7.5, §9.4), and validate the
-//!   ArtifactResponse, Response, then Assertion (§7.6).
-//! - `GET  /saml/sp/metadata`: serve the signed DV SP metadata (§8.3).
+//!   (§7.4), resolve it over the mTLS SOAP back-channel (§7.5, §9.4), and
+//!   validate the ArtifactResponse, Response and Assertion (§7.6).
+//! - `GET  /saml/sp/metadata`: the signed DV SP metadata (§8.3).
 //! - `/logout` (embedder-mounted [`handle_logout`]) + `POST /saml/sp/logout`:
 //!   SP-initiated logout (§7.7, §3.1.1.1).
 //! - `GET  /saml/sp/autosubmit.js`: the script the HTTP-POST binding page submits.
 //!
-//! The embedding application supplies an [`AuthConfig`](config::AuthConfig) and implements
-//! [`AuthState`] (create a session on login, tear it down on logout); all SAML
-//! state (keys, the verified RD descriptor, and pending-request IDs) lives in
-//! [`AuthServiceState`], which the handlers extract via `FromRef`.
-//!
-//! # Where the cryptography and wire format live
-//!
-//! - **Signing/verification (XML-DSig) and decryption (XML-Enc)** are delegated to
-//!   the pure-Rust `bergshamra-*` crates via the thin [`saml::crypto`] adapter.
-//! - **The signature/digest/c14n/encryption algorithms (§9.1/§9.3) are fixed in
-//!   the `templates/saml/*.xml` askama templates**, not in Rust constants, so the
-//!   templates are the source of truth for the wire format of outgoing messages.
-//!
-//! # Notable, deliberate design choices
-//!
-//! - **Verification keys come only from verified metadata (§9.2).** A signature's
-//!   `KeyInfo` (`KeyName`/`X509Certificate`) is used solely to *select* a trusted
-//!   cert from the RD descriptor, never as the trust root itself.
-//! - **The inner Assertion is not verified by its own signature.** Its authenticity
-//!   comes from the enveloping RD signature on the ArtifactResponse (verified in
-//!   [`saml::validation::validate_artifact_response_at`]) plus binding the Assertion
-//!   `Issuer` to the RD EntityID, matching the TVS reference impl `minvws/nl-rdo-max`.
-//!   Signatures inside an Assertion/`Advice` are treated as evidence only (§9.1).
+//! The embedding application supplies an [`AuthConfig`](config::AuthConfig) and
+//! implements [`AuthState`] (create a session on login, tear it down on logout,
+//! store pending request IDs); the SAML state (keys, the verified RD descriptor)
+//! lives in [`AuthServiceState`], which the handlers extract via `FromRef`.
 
 // A failed SAML flow must reach the user as the embedding application's error
 // page, never as a dead worker: the handlers turn every error into an
@@ -68,7 +74,8 @@ pub mod error;
 pub mod handlers;
 pub mod keys;
 pub mod pending;
-pub mod saml;
+pub mod pki;
+pub mod rd_metadata;
 pub mod state;
 #[cfg(feature = "tvs-mock")]
 mod tvs_mock;
@@ -85,9 +92,10 @@ use crate::handlers::{
 pub use crate::{
     handlers::{login::handle_login, logout::handle_logout},
     pending::{PENDING_REQUEST_TTL, PendingRequests},
-    saml::subject::SubjectId,
     state::{AuthFailure, AuthServiceState, AuthState, LoggedOutSession},
-    types::{Artifact, EndpointUrl, EntityId, MessageId, NameId, RedirectTarget, ServiceUuid},
+    types::{
+        Artifact, EndpointUrl, EntityId, MessageId, NameId, RedirectTarget, ServiceUuid, SubjectId,
+    },
 };
 
 /// Metadata endpoint path (eID §8.3): serves the signed SP metadata.

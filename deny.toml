@@ -42,4 +42,7 @@ ignore = [
 ]
 
 [sources]
-allow-git = []
+# gamlastan's Dutch eID (`profiles::nl_eid`) profile is consumed from its
+# development branch until it is released; drop this once `auth-service`
+# depends on a crates.io release.
+allow-git = ["https://github.com/marlonbaeten/gamlastan"]

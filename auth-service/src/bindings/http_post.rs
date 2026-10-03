@@ -37,7 +37,7 @@ struct PostFormTemplate<'a> {
 ///
 /// SECURITY: the widened value is metadata-derived, so it must not be able to
 /// smuggle in a directive of its own. Two things prevent that: `action_url` is
-/// validated upstream in [`crate::saml::idp_metadata`] to reject `;`, quotes
+/// validated upstream in [`crate::rd_metadata`] to reject `;`, quotes
 /// and whitespace, and `script-src` is emitted before `form-action` (see the
 /// ordering note on `csp::DEFAULT`), so a second `script-src` would lose to
 /// ours under CSP's first-occurrence-wins rule.
@@ -78,7 +78,7 @@ pub fn autosubmit_post_response(
     param_name: &str,
 ) -> Result<Response> {
     let html = create_post_form(action_url, saml_xml, param_name)?;
-    // The IdP URL is validated upstream ([`crate::saml::idp_metadata`] rejects
+    // The IdP URL is validated upstream ([`crate::rd_metadata`] rejects
     // `;`, quotes and whitespace), so a URL that is not representable in a
     // header value means something is badly wrong; refuse to serve the page
     // rather than degrade its CSP.

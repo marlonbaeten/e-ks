@@ -3,6 +3,7 @@ use std::{env, path::PathBuf};
 mod env_reader;
 
 use axum_extra::routing::TypedPath;
+use gamlastan::profiles::nl_eid::{LevelOfAssurance, NlEidConfig};
 
 use crate::{
     error::AuthError,
@@ -24,7 +25,7 @@ pub const RD_OIN: &str = "00000004000000149000";
 // standalone TVS mock used by all development/test environments: its
 // front-channel (metadata, browser redirects) is served over public TLS, while
 // its mTLS back-channel uses the repo's test CA, pinned by the `tvs-mock`
-// feature (see [`crate::saml::pki::BACKCHANNEL_ROOT_CA_PEM`]).
+// feature (see [`crate::pki::BACKCHANNEL_ROOT_CA_PEM`]).
 pub const TVS_TEST_BASE_URL: &str = "https://tvs-mock.eks-test.nl";
 pub const TVS_PREPRODUCTION_BASE_URL: &str = "https://pp2.toegang.overheid.nl";
 pub const TVS_PRODUCTION_BASE_URL: &str = "https://rd2.toegang.overheid.nl";
@@ -43,6 +44,14 @@ pub const RD_ENDPOINT_DOMAIN_TEST: &str = "eks-test.nl";
 // Kiesraad DV (Dienstverlener) display name, sent in the SP metadata /
 // AuthnRequest. Environment-independent.
 pub const DV_SERVICE_NAME: &str = "Kiesraad";
+
+/// Minimum LoA the Kiesraad DV accepts in incoming assertions. Per eID §7.6.3.2
+/// the DV MUST accept any LoA equal to or higher than the minimum registered for
+/// the Service, and reject anything lower (TVS "Checklist Testen" T6). Kiesraad
+/// enforces "Low" (MobileTwoFactorContract / eIDAS low) as that minimum; this
+/// MUST stay in step with the level registered during TVS onboarding. It is
+/// also the level the AuthnRequest asks for (`Comparison="minimum"`).
+pub const MINIMUM_LOA: LevelOfAssurance = LevelOfAssurance::Low;
 
 // Kiesraad DV EntityID per environment (eID §10.2:
 // `urn:nl-eid-gdi:1.0:DV:<OIN>:entities:<index>`), where the OIN
@@ -290,6 +299,23 @@ impl AuthConfig {
     pub fn preselected_ad_entity_id(&self) -> Option<EntityId> {
         self.preselected_ad
             .entity_id(self.environment.is_production())
+    }
+
+    /// The gamlastan eID profile configuration this deployment runs with: the DV
+    /// identity and endpoints, the pinned RD `entityID` of the environment as
+    /// the expected `Issuer`, and [`MINIMUM_LOA`]. gamlastan's defaults apply
+    /// for the rest: a 30 s clock skew, a 5 minute freshness window, and a
+    /// required RD signature on the assertion (TVS signs it with the same key
+    /// as the ArtifactResponse).
+    pub fn nl_eid(&self) -> NlEidConfig {
+        NlEidConfig::service_provider(
+            self.dv.entity_id.as_str(),
+            self.dv.service_uuid.as_str(),
+            self.dv.acs_url.as_str(),
+            self.environment.rd_entity_id().as_str(),
+            MINIMUM_LOA,
+        )
+        .with_single_logout_url(self.dv.slo_url.as_str())
     }
 
     /// Override `certs_dir` and rebuild every cert/key path that derives from
@@ -540,6 +566,36 @@ mod tests {
 
         let cfg = AuthConfig::default();
         assert_eq!(cfg.preselected_ad_entity_id(), None);
+    }
+
+    #[test]
+    fn nl_eid_config_mirrors_the_dv_config() {
+        let cfg = AuthConfig {
+            environment: Environment::Production,
+            dv: DvConfig {
+                entity_id: EntityId::from_static(DV_ENTITY_ID_PRODUCTION),
+                service_uuid: ServiceUuid::from_static(DV_SERVICE_UUID),
+                acs_url: EndpointUrl::from_base_url("https://eks.test/saml/sp/acs", "ACS").unwrap(),
+                slo_url: EndpointUrl::from_base_url("https://eks.test/saml/sp/logout", "SLO")
+                    .unwrap(),
+                ..Default::default()
+            },
+            ..AuthConfig::default()
+        };
+        let eid = cfg.nl_eid();
+        assert_eq!(eid.entity_id, DV_ENTITY_ID_PRODUCTION);
+        assert_eq!(eid.service_uuid, DV_SERVICE_UUID);
+        assert_eq!(eid.acs_url, "https://eks.test/saml/sp/acs");
+        assert_eq!(
+            eid.single_logout_url.as_deref(),
+            Some("https://eks.test/saml/sp/logout")
+        );
+        assert_eq!(eid.rd_entity_id, RD_ENTITY_ID_PRODUCTION);
+        assert_eq!(eid.minimum_loa, MINIMUM_LOA);
+        assert!(eid.require_assertion_signature);
+        assert!(eid.validate().is_ok());
+        // The unconfigured default cannot run a flow.
+        assert!(AuthConfig::default().nl_eid().validate().is_err());
     }
 
     #[test]

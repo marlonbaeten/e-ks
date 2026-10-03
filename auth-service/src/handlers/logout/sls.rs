@@ -1,12 +1,8 @@
 //! The SLS endpoint: receiving and verifying the RD's LogoutResponse (eID §7.7.2).
 
 use crate::{
-    saml::{
-        constants::NS_SAMLP,
-        validation::validate_logout_response,
-        verification::{ExpectedRoot, verify_xml_signature},
-    },
     state::{AuthServiceState, AuthState},
+    types::MessageId,
 };
 use axum::{
     Form,
@@ -14,6 +10,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use gamlastan::profiles::nl_eid::{LogoutResponseOutcome, validate_logout_response};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
@@ -61,14 +58,21 @@ async fn process_logout_response<S: AuthState>(
     };
     info!("[SLS] LogoutResponse received");
 
-    let Some(fields) = verified_logout_fields(auth_state, &saml_response) else {
+    let Some(outcome) = verified_logout_response(auth_state, &saml_response) else {
         return;
     };
 
     // eID §7.7.2: @InResponseTo MUST match a LogoutRequest this DV issued. Consume
     // it once (only after the signature verified, so a forged response cannot burn
     // a pending ID) to reject replays of a captured LogoutResponse.
-    if !state.consume_if_pending(fields.in_response_to).await {
+    let in_response_to = match MessageId::parse(outcome.in_response_to) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("[SLS] LogoutResponse InResponseTo is not a message ID: {e}; ignoring");
+            return;
+        }
+    };
+    if !state.consume_if_pending(in_response_to).await {
         warn!(
             "[SLS] LogoutResponse InResponseTo did not match an outstanding LogoutRequest \
              (unknown, expired, or replayed); ignoring"
@@ -78,19 +82,24 @@ async fn process_logout_response<S: AuthState>(
 
     // eID §7.7.2: report the status. A non-Success status does not change the
     // outcome (the local logout already completed) but is surfaced for diagnostics.
-    if fields.status_is_success {
+    if outcome.status.is_success() {
         info!("[SLS] LogoutResponse confirmed by RD (signed, correlated, status Success)");
     } else {
-        warn!("[SLS] LogoutResponse status not Success; local logout already completed");
+        warn!(
+            "[SLS] LogoutResponse status not Success ({}); local logout already completed",
+            outcome.status.status_code.value
+        );
     }
 }
 
-/// Verify the RD signature over the LogoutResponse and lift out its §7.7.2
-/// correlation fields, or `None` (logged) when it fails either gate.
-fn verified_logout_fields(
+/// Verify the RD signature over the LogoutResponse and its §7.7.2 binding to
+/// the RD and our SLS endpoint, or `None` (logged) when it fails either gate.
+/// The `InResponseTo` is not known up front (the pending-request store is keyed
+/// by it), so it is read from the verified response and consumed by the caller.
+fn verified_logout_response(
     auth_state: &AuthServiceState,
     saml_response: &str,
-) -> Option<crate::saml::validation::LogoutResponseFields> {
+) -> Option<LogoutResponseOutcome> {
     // Without the RD descriptor we cannot verify the signature; the user is
     // already logged out locally, so complete the logout rather than erroring.
     let Some(rd) = auth_state.rd_metadata() else {
@@ -98,30 +107,16 @@ fn verified_logout_fields(
         return None;
     };
 
-    // eID §7.7.2: the LogoutResponse MUST carry a valid RD signature.
-    // `validate_logout_response` re-parses these bytes, so both parses must agree
-    // on which element is verified and read.
-    let expected_root = ExpectedRoot {
-        namespace: NS_SAMLP,
-        local_name: "LogoutResponse",
-        id: None,
-    };
-    let sig_result = verify_xml_signature(saml_response, &rd.signing_keys, &expected_root);
-    if !sig_result.is_valid() {
-        warn!(
-            "[SLS] LogoutResponse signature invalid ({:?}); ignoring (local logout already done)",
-            sig_result.errors
-        );
-        return None;
-    }
-
-    // eID §7.7.2: bind the (signature-verified) response to the RD and our SLS
-    // endpoint and lift out the correlation fields.
-    let cfg = auth_state.auth_config();
-    match validate_logout_response(saml_response, &rd.entity_id, &cfg.dv.slo_url) {
-        Ok(fields) => Some(fields),
-        Err(reason) => {
-            warn!("[SLS] {reason}; ignoring");
+    match validate_logout_response(
+        &auth_state.auth_config().nl_eid(),
+        saml_response,
+        rd.verifier(),
+        None,
+        chrono::Utc::now(),
+    ) {
+        Ok(outcome) => Some(outcome),
+        Err(e) => {
+            warn!("[SLS] LogoutResponse rejected: {e}; ignoring (local logout already done)");
             None
         }
     }
