@@ -17,19 +17,6 @@ use crate::{
     keys::{ENCRYPTION_BASES, SIGNING_BASES, key_pair_paths, tls_paths},
 };
 
-/// Default for a required env var when the variable is unset; an explicit
-/// value still overrides this. `CERTS_DIR` is not
-/// here because the bundle is embedded rather than read from a path, and
-/// because a `CERTS_DIR` without a bundle also falls back to it (see
-/// [`certs_dir`]).
-pub(crate) fn default_for(name: &str) -> Option<String> {
-    match name {
-        "TVS_ENV" => Some("test".to_string()),
-        "BASE_URL" => Some("http://localhost:3000".to_string()),
-        _ => None,
-    }
-}
-
 /// The committed DV cert/key bundle (`auth-service/fixtures`), embedded at
 /// compile time. Paths are relative to this source file. Only the files the
 /// DV side reads are embedded; the `rd-*` fixtures (for running an RD mock)

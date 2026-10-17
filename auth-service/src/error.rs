@@ -28,6 +28,12 @@ impl From<crate::saml::xml_parser::XmlError> for AuthError {
     }
 }
 
+impl From<config::ConfigError> for AuthError {
+    fn from(e: config::ConfigError) -> Self {
+        AuthError::Config(e.to_string())
+    }
+}
+
 impl From<reqwest::Error> for AuthError {
     fn from(e: reqwest::Error) -> Self {
         AuthError::Http(e.to_string())
