@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
     AppError, AppRequestState, Context, CsbAction, CsbContext, CsbStore, CsbStoreData, CsbUser,
@@ -24,10 +25,11 @@ use crate::{
     store::StoreRegistry,
     structs::{
         brp::{BRP_BSN_BATCH_SIZE, BrpClient, BrpFinding, BrpStatus},
+        common::BsnOrNoneConfirmed,
         persons::Person,
     },
     trans,
-    utils::parse_hash_prefix,
+    utils::{PeerIp, parse_hash_prefix},
 };
 
 use super::{CsbCreateEmptyPath, CsbImportPath};
@@ -94,15 +96,19 @@ pub(in crate::csb) enum ImportResult {
 /// Import the package identified by the submitted chain hash into a fresh
 /// stream of `registry`. Shared by the examination and the pre-submission
 /// check, which differ only in the registry they import into.
+///
+/// `peer_ip` is the address the import was requested from, named in the
+/// warnings the BRP check it starts may raise.
 pub(in crate::csb) async fn import_package<S: AppRequestState>(
     state: &S,
     registry: &StoreRegistry<CsbStoreData>,
     form: ImportForm,
     user: CsbUser,
+    peer_ip: PeerIp,
     election: ElectionConfig,
     locale: Locale,
 ) -> Result<ImportResult, AppError> {
-    match do_import(state, registry, form, user, election, locale).await {
+    match do_import(state, registry, form, user, peer_ip, election, locale).await {
         Ok(ImportOutcome::Imported(stream_id)) => Ok(ImportResult::Imported(stream_id)),
         Ok(ImportOutcome::AlreadyImported { appellation }) => Ok(ImportResult::Retry {
             error: None,
@@ -129,6 +135,7 @@ pub async fn import_submit<S: AppRequestState>(
     _: CsbImportPath,
     State(state): State<S>,
     context: CsbContext,
+    peer_ip: PeerIp,
     Form(form): Form<ImportForm>,
 ) -> Result<Response, AppError> {
     let hash = form.hash.clone();
@@ -137,6 +144,7 @@ pub async fn import_submit<S: AppRequestState>(
         state.csb_store_registry(),
         form,
         context.user()?,
+        peer_ip,
         context.election,
         context.session.locale,
     )
@@ -187,6 +195,7 @@ async fn do_import<S: AppRequestState>(
     registry: &StoreRegistry<CsbStoreData>,
     form: ImportForm,
     user: CsbUser,
+    peer_ip: PeerIp,
     election: ElectionConfig,
     locale: Locale,
 ) -> Result<ImportOutcome, AppError> {
@@ -248,7 +257,7 @@ async fn do_import<S: AppRequestState>(
         })
         .await?;
 
-    do_brp_verification(&csb_store, state.brp_client()).await?;
+    do_brp_verification(&csb_store, state.brp_client(), peer_ip).await?;
 
     Ok(ImportOutcome::Imported(csb_store.stream_id))
 }
@@ -350,7 +359,14 @@ pub fn claim_sweep_for_test(stream_id: StreamId) -> impl Drop {
 /// Start the BRP check for every candidate on `store` in a background task,
 /// returning as soon as it is spawned. A sweep that is already running is left
 /// alone rather than joined by a second one.
-pub async fn do_brp_verification(store: &CsbStore, brp_client: &BrpClient) -> Result<(), AppError> {
+///
+/// `peer_ip` is the address the committee member requested the check from,
+/// named with them in the warnings of [`report_sensitive_lookups`].
+pub async fn do_brp_verification(
+    store: &CsbStore,
+    brp_client: &BrpClient,
+    peer_ip: PeerIp,
+) -> Result<(), AppError> {
     // Claimed first, so two concurrent requests cannot both get past here.
     let Some(claim) = SweepClaim::claim(store.stream_id) else {
         tracing::info!(
@@ -367,6 +383,7 @@ pub async fn do_brp_verification(store: &CsbStore, brp_client: &BrpClient) -> Re
     tokio::task::spawn(monitor_verification(
         store.clone(),
         brp_client.clone(),
+        peer_ip,
         claim,
     ));
 
@@ -376,8 +393,13 @@ pub async fn do_brp_verification(store: &CsbStore, brp_client: &BrpClient) -> Re
 /// Run the sweep and record how it ended. Anything that stops it early leaves
 /// the stream [`BrpStatus::Aborted`]: "finished" has to mean every candidate
 /// was actually checked. `_claim` is released once the outcome is recorded.
-async fn monitor_verification(store: CsbStore, brp_client: BrpClient, _claim: SweepClaim) {
-    let outcome = tokio::task::spawn(verify_candidates(store.clone(), brp_client)).await;
+async fn monitor_verification(
+    store: CsbStore,
+    brp_client: BrpClient,
+    peer_ip: PeerIp,
+    _claim: SweepClaim,
+) {
+    let outcome = tokio::task::spawn(verify_candidates(store.clone(), brp_client, peer_ip)).await;
 
     let error = match outcome {
         Ok(Ok(())) => return,
@@ -416,13 +438,58 @@ async fn record_brp_result(
         .await
 }
 
+/// Report the lookups in `batch` that monitoring should know about before
+/// they are sent, each with the committee member and address that asked for
+/// them and the candidate's last name:
+///
+/// - `event = "csb.brp_lookup_corrected_candidate"`: the candidate's details
+///   were corrected (on paper or by the committee) and no longer match the
+///   package as submitted, so the BRP is consulted on details the committee
+///   wrote.
+/// - `event = "csb.brp_lookup_without_bsn"`: the candidate has no
+///   burgerservicenummer, so the BRP is searched on name and date of birth
+///   rather than asked about one specific person.
+fn report_sensitive_lookups(store: &CsbStore, batch: &[Person], peer_ip: PeerIp) {
+    for person in batch {
+        let paper_corrected = store.is_person_paper_corrected(person.id);
+        let csb_corrected = store.has_candidate_csb_corrections(person.id);
+        if paper_corrected || csb_corrected {
+            warn!(
+                event = "csb.brp_lookup_corrected_candidate",
+                user = ?store.user(),
+                ip = %peer_ip,
+                stream_id = %store.stream_id,
+                last_name = %person.name.last_name,
+                paper_corrected,
+                csb_corrected,
+                "BRP lookup requested for a corrected candidate"
+            );
+        }
+
+        if !matches!(person.personal_data.bsn, Some(BsnOrNoneConfirmed::Bsn(_))) {
+            warn!(
+                event = "csb.brp_lookup_without_bsn",
+                user = ?store.user(),
+                ip = %peer_ip,
+                stream_id = %store.stream_id,
+                last_name = %person.name.last_name,
+                "BRP lookup requested for a candidate without a burgerservicenummer"
+            );
+        }
+    }
+}
+
 /// Check every candidate not covered by `CsbStoreData::brp_findings` yet,
 /// [`BRP_BSN_BATCH_SIZE`] per request; the client paces the requests.
 ///
 /// The corrected data is checked, since that is what the committee examines.
 /// Errors propagate: the BRP being unreachable must not record the remaining
 /// candidates as clean.
-async fn verify_candidates(store: CsbStore, brp_client: BrpClient) -> Result<(), AppError> {
+async fn verify_candidates(
+    store: CsbStore,
+    brp_client: BrpClient,
+    peer_ip: PeerIp,
+) -> Result<(), AppError> {
     let already_checked = store.get_brp_findings();
     let unchecked: Vec<Person> = store
         .get_persons(WithCorrections::All)
@@ -431,6 +498,7 @@ async fn verify_candidates(store: CsbStore, brp_client: BrpClient) -> Result<(),
         .collect();
 
     for batch in unchecked.chunks(BRP_BSN_BATCH_SIZE) {
+        report_sensitive_lookups(&store, batch, peer_ip);
         let checked = brp_client.verify_batch(batch).await;
         // Every request goes on record first, answered or failed.
         for lookup in checked.lookups {
@@ -459,20 +527,138 @@ async fn verify_candidates(store: CsbStore, brp_client: BrpClient) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
 
     use super::*;
     use axum::http::StatusCode;
+    use tracing_test::traced_test;
 
     use crate::{
         AppState,
         CsbAction::Delete,
-        CsbContext, ElectionConfig, PgEvent, Province,
+        CsbContext, CsbStream, ElectionConfig, PgEvent, Province,
         brp_stub::{BrpStub, matching_record},
-        structs::brp::{BrpFindingKind, BrpLookup, BrpLookupOutcome, BrpQuery, BrpValue},
-        test_utils::{response_body_string, sample_person_from_brp},
+        structs::{
+            brp::{BrpFindingKind, BrpLookup, BrpLookupOutcome, BrpQuery, BrpValue},
+            csb::{Correction, PersonCorrection},
+            persons::PersonId,
+        },
+        test_utils::{response_body_string, sample_person_from_brp, sample_person_with_last_name},
         utils::format_hash,
     };
+
+    /// A store acted on by the committee member `alice`, so the warnings can
+    /// be checked for her name.
+    fn store_acting_as_alice() -> CsbStore {
+        CsbStore::acting_as(
+            CsbStream::new_for_test(),
+            CsbUser::SecurityKey {
+                username: "alice".parse().expect("valid username"),
+            },
+        )
+    }
+
+    const PEER: PeerIp = PeerIp(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))));
+
+    #[traced_test]
+    #[tokio::test]
+    async fn an_unchanged_candidate_with_a_bsn_is_looked_up_without_a_warning() {
+        let store = store_acting_as_alice();
+        let person = sample_person_from_brp();
+        store.add_person(person.clone());
+
+        report_sensitive_lookups(&store, &[person], PEER);
+
+        assert!(!logs_contain("csb.brp_lookup"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_lookup_of_a_candidate_without_bsn_is_reported() {
+        let store = store_acting_as_alice();
+        // `sample_person` has a confirmed absent burgerservicenummer
+        let confirmed_none = sample_person_with_last_name(PersonId::new(), "Zonderbsn");
+        let mut unknown = sample_person_with_last_name(PersonId::new(), "Onbekend");
+        unknown.personal_data.bsn = None;
+        store.add_person(confirmed_none.clone());
+        store.add_person(unknown.clone());
+
+        report_sensitive_lookups(&store, &[confirmed_none, unknown], PEER);
+
+        assert!(logs_contain("csb.brp_lookup_without_bsn"));
+        assert!(logs_contain("alice"));
+        assert!(logs_contain("203.0.113.8"));
+        assert!(logs_contain("Zonderbsn"));
+        assert!(logs_contain("Onbekend"));
+        assert!(!logs_contain("csb.brp_lookup_corrected_candidate"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_lookup_of_a_csb_corrected_candidate_is_reported() -> Result<(), AppError> {
+        let store = store_acting_as_alice();
+        let person = sample_person_from_brp();
+        store.add_person(person.clone());
+        store
+            .update(CsbAction::UpdateCorrection(Correction::Person(
+                person.id,
+                PersonCorrection::LastName("Gecorrigeerd".parse().unwrap()),
+            )))
+            .await?;
+        let corrected = store
+            .get_person(person.id, WithCorrections::All)
+            .expect("person");
+
+        report_sensitive_lookups(&store, &[corrected], PEER);
+
+        assert!(logs_contain("csb.brp_lookup_corrected_candidate"));
+        assert!(logs_contain("alice"));
+        assert!(logs_contain("203.0.113.8"));
+        assert!(logs_contain("Gecorrigeerd"));
+        assert!(logs_contain("csb_corrected=true"));
+        assert!(logs_contain("paper_corrected=false"));
+        assert!(!logs_contain("csb.brp_lookup_without_bsn"));
+
+        Ok(())
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_lookup_of_a_paper_corrected_candidate_is_reported() {
+        let store = store_acting_as_alice();
+        let person = sample_person_from_brp();
+        // added during paper corrections: absent from the imported package
+        store
+            .write()
+            .paper_corrected_data
+            .persons
+            .insert(person.id, person.clone());
+
+        report_sensitive_lookups(&store, &[person], PEER);
+
+        assert!(logs_contain("csb.brp_lookup_corrected_candidate"));
+        assert!(logs_contain("alice"));
+        assert!(logs_contain("Bruin"));
+        assert!(logs_contain("paper_corrected=true"));
+        assert!(logs_contain("csb_corrected=false"));
+    }
+
+    /// Without a recorded peer address the warning still names the user.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_warning_without_peer_address_says_so() {
+        let store = store_acting_as_alice();
+        let person = sample_person_with_last_name(PersonId::new(), "Zonderbsn");
+        store.add_person(person.clone());
+
+        report_sensitive_lookups(&store, &[person], PeerIp(None));
+
+        assert!(logs_contain("csb.brp_lookup_without_bsn"));
+        assert!(logs_contain("ip=unknown"));
+    }
 
     /// The middleware recognises the status polls by their suffix, so both
     /// status routes have to end with it.
@@ -562,6 +748,7 @@ mod tests {
             CsbImportPath {},
             State(state.clone()),
             CsbContext::new_test(),
+            PeerIp(None),
             Form(ImportForm {
                 hash: hash.to_string(),
                 confirmed_hash: confirmed_hash.map(str::to_string),
@@ -594,6 +781,7 @@ mod tests {
             CsbImportPath {},
             State(state),
             context,
+            PeerIp(None),
             Form(ImportForm {
                 hash: "not-a-hash".to_string(),
                 confirmed_hash: None,
@@ -617,6 +805,7 @@ mod tests {
             CsbImportPath {},
             State(state),
             context,
+            PeerIp(None),
             Form(ImportForm {
                 hash: "F381 3DE7 96D3 8033".to_string(),
                 confirmed_hash: None,
@@ -640,6 +829,7 @@ mod tests {
             CsbImportPath {},
             State(state.clone()),
             context,
+            PeerIp(None),
             Form(ImportForm {
                 hash,
                 confirmed_hash: None,
@@ -828,7 +1018,7 @@ mod tests {
         record["verblijfplaats"]["verblijfadres"]["woonplaats"] = serde_json::json!("Amsterdam");
         let stub = BrpStub::serving(vec![record]).await;
 
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
 
         assert_eq!(
@@ -862,7 +1052,7 @@ mod tests {
 
         let stub = BrpStub::serving(vec![matching_record(&bsn)]).await;
 
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
 
         // Present in the map with no findings: checked, and nothing found.
@@ -896,7 +1086,7 @@ mod tests {
         let csb_store = store_with_candidate(&state, person).await?;
         let stub = BrpStub::serving(vec![matching_record(&bsn)]).await;
 
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
 
         let lookups = recorded_lookups(&csb_store);
@@ -938,7 +1128,7 @@ mod tests {
         // Port 1 on loopback refuses connections.
         let brp_client = BrpClient::new_for_test("http://127.0.0.1:1");
 
-        do_brp_verification(&csb_store, &brp_client).await?;
+        do_brp_verification(&csb_store, &brp_client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Aborted(_))).await;
 
         let lookups = recorded_lookups(&csb_store);
@@ -960,7 +1150,7 @@ mod tests {
         // Port 1 on loopback refuses connections.
         let brp_client = BrpClient::new_for_test("http://127.0.0.1:1");
 
-        do_brp_verification(&csb_store, &brp_client).await?;
+        do_brp_verification(&csb_store, &brp_client, PeerIp(None)).await?;
         let status =
             wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Aborted(_))).await;
 
@@ -991,7 +1181,7 @@ mod tests {
         let stub = BrpStub::serving_with_interval(Vec::new(), interval).await;
 
         let start = tokio::time::Instant::now();
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         let elapsed = start.elapsed();
         assert!(
             elapsed < interval,
@@ -1016,7 +1206,7 @@ mod tests {
         }
 
         let stub = BrpStub::serving(Vec::new()).await;
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
 
         // They share one burgerservicenummer, so one lookup covers them.
@@ -1045,12 +1235,12 @@ mod tests {
 
         let stub = BrpStub::serving(vec![matching_record(&bsn)]).await;
 
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
         assert_eq!(stub.query_count(), 1);
 
         // Nothing is left to check, so there is no status to wait for.
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(stub.query_count(), 1);
 
@@ -1073,7 +1263,7 @@ mod tests {
         assert!(!brp_sweep_running(csb_store.stream_id));
 
         let stub = BrpStub::serving(vec![matching_record(&bsn)]).await;
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
 
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
         assert_eq!(
@@ -1095,7 +1285,7 @@ mod tests {
         let csb_store = store_with_candidate(&state, person).await?;
 
         let stub = BrpStub::serving(vec![matching_record(&bsn)]).await;
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
 
         assert!(
@@ -1121,11 +1311,11 @@ mod tests {
         }
 
         let stub = BrpStub::serving_with_interval(Vec::new(), Duration::from_millis(20)).await;
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         assert!(brp_sweep_running(csb_store.stream_id));
 
         // A second sweep would take the same snapshot and ask twice.
-        do_brp_verification(&csb_store, &stub.client).await?;
+        do_brp_verification(&csb_store, &stub.client, PeerIp(None)).await?;
         assert!(brp_sweep_running(csb_store.stream_id));
 
         wait_for_brp_status(&csb_store, |status| matches!(status, BrpStatus::Finished)).await;
@@ -1149,6 +1339,7 @@ mod tests {
             CsbImportPath {},
             State(state.clone()),
             context,
+            PeerIp(None),
             Form(ImportForm {
                 hash: hash.clone(),
                 confirmed_hash: None,
@@ -1173,6 +1364,7 @@ mod tests {
             CsbImportPath {},
             State(state.clone()),
             context,
+            PeerIp(None),
             Form(ImportForm {
                 hash: hash.clone(),
                 confirmed_hash: None,

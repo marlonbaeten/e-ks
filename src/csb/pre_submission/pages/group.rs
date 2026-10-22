@@ -22,6 +22,7 @@ use crate::{
     },
     filters, redirect_success,
     structs::problems::AllProblems,
+    utils::PeerIp,
 };
 
 #[derive(Template)]
@@ -76,9 +77,10 @@ pub async fn group(
 pub async fn start_brp_check<S: AppRequestState>(
     path: CsbPreSubmissionBrpCheckPath,
     State(state): State<S>,
+    peer_ip: PeerIp,
     store: PreSubmissionStore,
 ) -> Result<Response, AppError> {
-    do_brp_verification(&store, state.brp_client()).await?;
+    do_brp_verification(&store, state.brp_client(), peer_ip).await?;
 
     Ok(redirect_success(CsbPreSubmissionGroupPath {
         stream_id: path.stream_id,
@@ -301,6 +303,7 @@ mod tests {
         let response = start_brp_check(
             CsbPreSubmissionBrpCheckPath { stream_id },
             State(state),
+            PeerIp(None),
             PreSubmissionStore(store.0.clone()),
         )
         .await

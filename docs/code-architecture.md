@@ -693,6 +693,22 @@ Three markers guard the CSB section, all off until configured (see
   `CSB_PROXY_PROTOCOL_FROM` without a valid PROXY protocol v2 header, dropped
   before the TLS handshake. Carries the proxy's address and the error.
 
+Two more mark BRP lookups that deserve a second look, always on. A committee
+member requests lookups by importing a package or starting (or resuming) its
+BRP check, which then consults the BRP on every candidate not checked before;
+each of these is raised per such candidate, right before the request is sent,
+and carries the committee user, the peer address of the request that started
+the check, the stream and the candidate's last name:
+
+- `event="csb.brp_lookup_corrected_candidate"`: the candidate's details were
+  corrected, on paper (`paper_corrected`, which includes a candidate added
+  during paper corrections) or by the committee (`csb_corrected`), so the BRP
+  is consulted on details the committee wrote rather than on the package as
+  submitted.
+- `event="csb.brp_lookup_without_bsn"`: the candidate has no
+  burgerservicenummer, so the BRP is searched on last name and date of birth
+  rather than asked about one specific person.
+
 The peer address in all of these is the TCP peer, or the client a listed
 proxy announced.
 

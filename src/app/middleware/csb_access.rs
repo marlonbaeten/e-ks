@@ -16,13 +16,13 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     hash::Hash,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -31,7 +31,11 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use tracing::warn;
 
-use crate::{AppState, Session, SessionUser, constants::DEFAULT_TIMEZONE, utils::peer_ip_label};
+use crate::{
+    AppState, Session, SessionUser,
+    constants::DEFAULT_TIMEZONE,
+    utils::{PeerIp, peer_ip_label},
+};
 
 /// Request-extension marker for the public listener next to a dedicated CSB
 /// listener (`CSB_BIND_ADDRESS` set). The session middleware refuses
@@ -42,10 +46,7 @@ pub struct PublicListener;
 /// The connection's peer address, recorded by the server through
 /// `into_make_service_with_connect_info`.
 fn peer_ip(request: &Request) -> Option<IpAddr> {
-    request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip())
+    PeerIp::from_extensions(request.extensions()).0
 }
 
 /// Refuses requests whose peer address is not on the allow list with `403`.
@@ -141,8 +142,10 @@ impl<K: Hash + Eq> AlertThrottle<K> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
-    use axum::{Router, body::Body, http::Request, middleware, routing::get};
+    use axum::{Router, body::Body, extract::ConnectInfo, http::Request, middleware, routing::get};
     use chrono::TimeDelta;
     use tower::ServiceExt;
     use tracing_test::traced_test;
