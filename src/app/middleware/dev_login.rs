@@ -110,6 +110,7 @@ impl<'a> DevLogin<'a> {
             state,
             query,
             session,
+            peer_ip,
         }
     }
 
