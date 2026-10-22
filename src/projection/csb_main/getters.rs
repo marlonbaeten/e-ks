@@ -93,7 +93,11 @@ mod tests {
         let store = CsbMainStore::new_for_test();
         let credential_id = crate::CredentialId::from(vec![0x11; 16]);
         let record = |sign_count| {
-            store.record_security_key_login(CsbUser::new_test(), credential_id.clone(), sign_count)
+            store.record_security_key_login(
+                CsbUser::new_test().into(),
+                credential_id.clone(),
+                sign_count,
+            )
         };
 
         assert!(record(5).await.unwrap());

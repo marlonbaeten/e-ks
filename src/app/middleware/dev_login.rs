@@ -8,14 +8,14 @@ use secrecy::SecretString;
 use serde::Deserialize;
 
 use crate::{
-    AppError, AppState, CsbMainAction, CsbUser, ElectionConfig, Locale, PgEvent, PgStoreData,
-    Session, SessionUser, StreamId,
+    AppError, AppState, CsbActor, CsbMainAction, CsbUser, ElectionConfig, Locale, PgEvent,
+    PgStoreData, Session, SessionUser, StreamId,
     auth::session_extractor::{establish_session, user_agent_hash},
     common::{PgIndexPath, SelectElectionPath},
     csb::index::CsbIndexPath,
     store::Store,
     structs::{common::Appellation, political_groups::PoliticalGroup},
-    utils::format_hash,
+    utils::{PeerIp, format_hash},
 };
 
 pub const DEV_LOGIN_PATH: &str = "/dev/login";
@@ -48,8 +48,9 @@ pub async fn dev_login(
     jar: CookieJar,
     Query(query): Query<DevLoginQuery>,
     headers: axum::http::HeaderMap,
+    peer_ip: PeerIp,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut login = DevLogin::new(&state, &query, &headers);
+    let mut login = DevLogin::new(&state, &query, &headers, peer_ip);
     let (redirect_to, last_event_hash) = login.run().await?;
     let session = login.session;
 
@@ -74,13 +75,20 @@ struct DevLogin<'a> {
     state: &'a AppState,
     query: &'a DevLoginQuery,
     session: Session,
+    /// The peer address of the request, recorded on the login event.
+    peer_ip: PeerIp,
 }
 
 impl<'a> DevLogin<'a> {
     /// Builds the session: its identity from `csb` (a committee member, or a
     /// political group with its stream derived from `bsn`), in the default
     /// locale and with the user agent from the request headers.
-    fn new(state: &'a AppState, query: &'a DevLoginQuery, headers: &axum::http::HeaderMap) -> Self {
+    fn new(
+        state: &'a AppState,
+        query: &'a DevLoginQuery,
+        headers: &axum::http::HeaderMap,
+        peer_ip: PeerIp,
+    ) -> Self {
         let locale = Locale::default();
         let mut session = match query.csb {
             // Committee members share the CSB main stream, and dev logins are
@@ -136,7 +144,9 @@ impl<'a> DevLogin<'a> {
     async fn csb(&mut self, user: CsbUser, election: ElectionConfig) -> Result<String, AppError> {
         // All committee members share a single stream.
         let store = self.state.csb_main_store(election).await?;
-        store.update(CsbMainAction::Login.by(user.clone())).await?;
+        store
+            .update(CsbMainAction::Login.by(CsbActor::new(user.clone(), self.peer_ip)))
+            .await?;
 
         #[cfg(feature = "fixtures")]
         if self.query.fixtures.unwrap_or(false) {
@@ -405,6 +415,7 @@ mod tests {
                 payload: CsbMainEvent {
                     user: CsbUser::Developer,
                     action: CsbMainAction::Login,
+                    ..
                 },
                 ..
             }]

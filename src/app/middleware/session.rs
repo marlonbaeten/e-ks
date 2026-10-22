@@ -15,13 +15,14 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{csb_access::PublicListener, maintenance::handle_db_error};
 use crate::{
-    AppError, AppState, CsbStore, PgStore, SESSION_COOKIE_NAME, Session, SessionUser,
+    AppError, AppState, CsbActor, CsbStore, PgStore, SESSION_COOKIE_NAME, Session, SessionUser,
     auth::{csrf_guard::enforce_csrf, session_extractor::user_agent_hash},
     common::{LoginStartPath, PgIndexPath, SelectElectionPath, SessionExpiryPath},
     csb::{import::is_brp_status_poll, index::CsbIndexPath},
     csrf_rejection_response,
     finalise::FinalisePath,
     store::{Store, StoreData},
+    utils::PeerIp,
 };
 
 /// Middleware that loads or creates a session and stores it in request extensions.
@@ -187,13 +188,13 @@ pub async fn store_middleware(
                 return Redirect::to(&PgIndexPath.to_string()).into_response();
             }
 
-            let user = user.clone();
+            let actor = CsbActor::new(user.clone(), PeerIp::from_extensions(request.extensions()));
             let resolved = state
                 .csb_store_registry
                 .get_store(stream_id, *election)
                 .await;
             inject_loaded_store(&state, resolved, request, next, |store| {
-                CsbStore::acting_as(store, user).paper_corrections()
+                CsbStore::acting_as(store, actor).paper_corrections()
             })
             .await
         }

@@ -38,7 +38,7 @@ pub async fn update_order(
     }
 
     main_store
-        .update(CsbMainAction::UpdateListOrder(payload.stream_ids).by(context.user()?))
+        .update(CsbMainAction::UpdateListOrder(payload.stream_ids).by(context.actor()?))
         .await?;
 
     Ok(StatusCode::NO_CONTENT)

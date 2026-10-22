@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::{
     AppError, AppRequestState, Context, CsbAction, CsbContext, CsbEvent, CsbMainStore, CsbStream,
     ElectionConfig, Event, HasCsbUser, HtmlTemplate, Locale, Overlay, QueryParamState,
-    csb::audit_log::pages::CsbAuditLogDetailPath,
+    csb::audit_log::{pages::CsbAuditLogDetailPath, structs::peer_ip_text},
     filters,
     projection::{CSB_MAIN_STREAM_ID, WithCorrections},
     store::StoreEvent,
@@ -28,6 +28,8 @@ struct CsbEventDetail {
     description: String,
     /// Human-readable label for the committee member that triggered the event
     user: String,
+    /// The peer address the member acted from; empty when the event holds none.
+    ip: String,
     details: String,
     created_at: DateTime<Utc>,
     changes: Vec<FieldChange>,
@@ -62,6 +64,7 @@ impl CsbEventDetail {
             stream_label,
             description: event.payload.description(locale),
             user: event.payload.csb_user().describe(locale),
+            ip: peer_ip_text(event.payload.peer_ip()),
             details: event.payload.details(),
             changes: event.payload.changes(locale),
             created_at: event.created_at,
@@ -411,7 +414,7 @@ mod tests {
     };
 
     use crate::{
-        AppError, AppState, CsbAction, CsbContext, CsbMainAction, CsbMainStore, CsbUser,
+        AppError, AppState, CsbAction, CsbActor, CsbContext, CsbMainAction, CsbMainStore, CsbUser,
         ElectionConfig, QueryParamState, StreamId, csb::audit_log::pages::CsbAuditLogDetailPath,
         test_utils::response_body_string,
     };
@@ -442,6 +445,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_body_string(response).await;
         assert!(body.contains("Signed in"));
+        // an event without a recorded peer address shows no address row
+        assert!(!body.contains("IP address"), "{body}");
+
+        Ok(())
+    }
+
+    /// The detail names the peer address the member acted from.
+    #[tokio::test]
+    async fn renders_the_peer_address_of_the_event() -> Result<(), AppError> {
+        let main_store = CsbMainStore::new_for_test();
+        let actor = CsbActor {
+            user: CsbUser::Developer,
+            ip: Some("203.0.113.8".parse().unwrap()),
+        };
+        main_store.update(CsbMainAction::Login.by(actor)).await?;
+
+        let state = AppState::new_for_tests().await;
+
+        let response = csb_audit_log_detail(
+            CsbAuditLogDetailPath {
+                stream_id: CSB_MAIN_STREAM_ID,
+                event_id: 1,
+            },
+            CsbContext::new_test(),
+            main_store,
+            State(state),
+            Query(QueryParamState::default()),
+        )
+        .await
+        .unwrap()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body_string(response).await;
+        assert!(body.contains("<dt>IP address</dt>"), "{body}");
+        assert!(body.contains("203.0.113.8"), "{body}");
 
         Ok(())
     }

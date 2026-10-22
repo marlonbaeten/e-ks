@@ -119,6 +119,7 @@ fields:
   details: Details
   event: Gebeurtenis
   event_id: "#"
+  ip: IP-adres
   stream: Stream
   subject_id: Subject-ID
   timestamp: Tijdstip

@@ -123,7 +123,7 @@ pub(crate) use app::middleware::proxy_handler;
 // `pub` because the `eks` binary's tests reference `eks::SESSION_COOKIE_NAME`.
 pub use auth::session_extractor::SESSION_COOKIE_NAME;
 pub(crate) use auth::{
-    csb_user::{CsbUser, HasCsbUser},
+    csb_user::{CsbActor, CsbUser, HasCsbUser},
     derive_id::IdDeriver,
     pending_request_store::PendingRequestStore,
     session::{Session, SessionExpiry},

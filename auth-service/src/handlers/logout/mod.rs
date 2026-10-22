@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::CookieJar;
+use std::net::IpAddr;
 use tracing::{debug, error, info, warn};
 
 /// SP-initiated logout per eID §7.7.1 / §3.1.1.1, mounted by the embedding
@@ -33,6 +34,7 @@ use tracing::{debug, error, info, warn};
 pub async fn handle_logout<S>(
     state: &S,
     jar: CookieJar,
+    peer: Option<IpAddr>,
     post_logout_redirect: &RedirectTarget,
 ) -> Response
 where
@@ -44,7 +46,7 @@ where
     // The local session is torn down first; a failure there is the response.
     // The NameID is only present if one was recorded at login (needed to build
     // the LogoutRequest, eID §7.7.1).
-    let (cleared_jar, ended) = match state.logout_session(jar).await {
+    let (cleared_jar, ended) = match state.logout_session(jar, peer).await {
         Ok(ended) => ended,
         Err(response) => return response,
     };
@@ -124,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn logout_without_active_session_redirects_home() {
         let mock = MockAuthState::empty();
-        let resp = handle_logout(&mock, CookieJar::new(), &RedirectTarget::root()).await;
+        let resp = handle_logout(&mock, CookieJar::new(), None, &RedirectTarget::root()).await;
         assert!(resp.status().is_redirection());
     }
 
@@ -136,7 +138,7 @@ mod tests {
         mock.session = LoggedOutSession::WithSamlSubject(
             NameId::parse("_transient-name-id").expect("test NameID"),
         );
-        let resp = handle_logout(&mock, CookieJar::new(), &RedirectTarget::root()).await;
+        let resp = handle_logout(&mock, CookieJar::new(), None, &RedirectTarget::root()).await;
         assert!(resp.status().is_redirection());
     }
 

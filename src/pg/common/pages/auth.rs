@@ -16,7 +16,7 @@ use axum_extra::routing::TypedPath;
 use super::{LoggedOutPath, LogoutPath};
 use crate::{
     AppRequestState, Context, HtmlTemplate, Locale, LocaleValues, QueryParamState, Session,
-    SessionPageValues, auth::session::session_idle_timeout, filters,
+    SessionPageValues, auth::session::session_idle_timeout, filters, utils::PeerIp,
 };
 
 #[derive(Template)]
@@ -77,12 +77,17 @@ const LOGGED_OUT: RedirectTarget = RedirectTarget::from_static(LoggedOutPath::PA
 
 /// POST `/logout`: starts SP-initiated logout (eID §7.7.1); the session
 /// middleware has already verified the CSRF token.
-pub async fn logout_submit<S>(_: LogoutPath, State(state): State<S>, jar: CookieJar) -> Response
+pub async fn logout_submit<S>(
+    _: LogoutPath,
+    State(state): State<S>,
+    peer_ip: PeerIp,
+    jar: CookieJar,
+) -> Response
 where
     S: AppRequestState + AuthState,
     AuthServiceState: FromRef<S>,
 {
-    handle_logout(&state, jar, &LOGGED_OUT).await
+    handle_logout(&state, jar, peer_ip.0, &LOGGED_OUT).await
 }
 
 /// GET `/logged-out`: post-logout confirmation page (TVS T7, also the SLO
@@ -371,7 +376,7 @@ mod tests {
         );
 
         let _ = state
-            .logout_session(jar_with_session_cookie(&token))
+            .logout_session(jar_with_session_cookie(&token), None)
             .await
             .expect("logout session");
 
@@ -386,7 +391,7 @@ mod tests {
         // Nothing to clear when the request carried no session cookie.
         let state = crate::AppState::new_for_tests().await;
         let (_jar, ended) = state
-            .logout_session(CookieJar::new())
+            .logout_session(CookieJar::new(), None)
             .await
             .expect("logout session");
         assert_eq!(ended, LoggedOutSession::None);
@@ -396,7 +401,10 @@ mod tests {
     async fn logout_session_unknown_session_clears_and_reports_no_session() {
         let state = crate::AppState::new_for_tests().await;
         let jar = jar_with_session_cookie("no-such-token");
-        let (jar, ended) = state.logout_session(jar).await.expect("logout session");
+        let (jar, ended) = state
+            .logout_session(jar, None)
+            .await
+            .expect("logout session");
         assert_eq!(ended, LoggedOutSession::None);
         assert!(clears_session_cookie(jar));
     }
@@ -414,7 +422,10 @@ mod tests {
         state.sessions().insert(session).await;
 
         let jar = jar_with_session_cookie(&token);
-        let (jar, ended) = state.logout_session(jar).await.expect("logout session");
+        let (jar, ended) = state
+            .logout_session(jar, None)
+            .await
+            .expect("logout session");
         assert_eq!(
             ended,
             LoggedOutSession::WithSamlSubject(NameId::parse("name-id-xyz").unwrap())
@@ -441,7 +452,10 @@ mod tests {
         state.sessions().insert(session).await;
 
         let jar = jar_with_session_cookie(&token);
-        let (jar, ended) = state.logout_session(jar).await.expect("logout session");
+        let (jar, ended) = state
+            .logout_session(jar, None)
+            .await
+            .expect("logout session");
         assert_eq!(ended, LoggedOutSession::WithoutSamlSubject);
         assert!(clears_session_cookie(jar));
         assert!(

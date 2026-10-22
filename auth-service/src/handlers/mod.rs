@@ -24,7 +24,7 @@ pub(crate) mod test_support {
     };
     use axum_extra::extract::CookieJar;
     use parking_lot::Mutex;
-    use std::{collections::HashSet, sync::Arc};
+    use std::{collections::HashSet, net::IpAddr, sync::Arc};
 
     /// Minimal [`AuthState`] wrapping an [`AuthServiceState`], used to drive the
     /// handlers directly without a router. Encodes each [`AuthFailure`] kind as
@@ -96,6 +96,7 @@ pub(crate) mod test_support {
         async fn logout_session(
             &self,
             jar: CookieJar,
+            _peer: Option<IpAddr>,
         ) -> Result<(CookieJar, LoggedOutSession), Response> {
             Ok((jar, self.session.clone()))
         }

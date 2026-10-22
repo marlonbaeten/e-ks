@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use axum_extra::routing::TypedPath;
 use chrono::{DateTime, Utc};
 
@@ -16,6 +18,9 @@ pub struct CsbAuditLogEntry {
     pub description: String,
     /// Human-readable label for the committee member that triggered the event
     pub user: String,
+    /// The peer address the member acted from; empty when the event holds
+    /// none (recorded before it was kept, or without a request behind it).
+    pub ip: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -33,6 +38,7 @@ impl CsbAuditLogEntry {
             stream_label,
             description: event.payload.description(locale),
             user: event.payload.csb_user().describe(locale),
+            ip: peer_ip_text(event.payload.peer_ip()),
             created_at: event.created_at,
         }
     }
@@ -42,6 +48,7 @@ impl CsbAuditLogEntry {
         self.description.to_lowercase().contains(&query)
             || self.stream_label.to_lowercase().contains(&query)
             || self.user.to_lowercase().contains(&query)
+            || self.ip.contains(&query)
     }
 
     /// Detail path carrying `return_to` as a `redirect_to` query param, so
@@ -56,11 +63,20 @@ impl CsbAuditLogEntry {
     }
 }
 
+/// The peer address an event recorded, as the audit log shows it: the address,
+/// or nothing for an event without one.
+pub fn peer_ip_text(ip: Option<IpAddr>) -> String {
+    ip.map(|ip| ip.to_string()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
     use crate::{
-        CsbAction, CsbMainAction, CsbUser, Locale, PgStoreData, StreamId, store::StoreEvent,
+        CsbAction, CsbActor, CsbMainAction, CsbUser, Locale, PgStoreData, StreamId,
+        store::StoreEvent,
     };
 
     const EN: Locale = Locale::En;
@@ -200,5 +216,28 @@ mod tests {
         assert_eq!(entry.user, "Committee member alice");
         assert!(entry.matches_search("alice"));
         assert!(entry.matches_search("committee"));
+    }
+
+    /// The address column shows the peer address the event recorded and is
+    /// searchable; an event without one shows nothing there.
+    #[test]
+    fn from_event_sets_searchable_peer_address() {
+        let sid = stream_id();
+        let actor = CsbActor {
+            user: CsbUser::Developer,
+            ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8))),
+        };
+        let event = StoreEvent::new(1, CsbMainAction::Login.by(actor));
+
+        let entry = CsbAuditLogEntry::from_event(&event, sid, "Stream".to_string(), EN);
+
+        assert_eq!(entry.ip, "203.0.113.8");
+        assert!(entry.matches_search("203.0.113"));
+
+        let event = StoreEvent::new(2, CsbMainAction::Login.by(CsbUser::Developer));
+        let entry = CsbAuditLogEntry::from_event(&event, sid, "Stream".to_string(), EN);
+
+        assert_eq!(entry.ip, "");
+        assert!(!entry.matches_search("203"));
     }
 }

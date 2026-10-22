@@ -20,6 +20,12 @@
       <dd>
         {{ detail.user }}
       </dd>
+      {% if !detail.ip.is_empty() %}
+        <dt>{{ "audit_log.fields.ip"|trans }}</dt>
+        <dd>
+          {{ detail.ip }}
+        </dd>
+      {% endif %}
       {% if !detail.details.is_empty() %}
         <dt>{{ "audit_log.fields.details"|trans }}</dt>
         <dd>

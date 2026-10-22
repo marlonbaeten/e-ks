@@ -1,8 +1,10 @@
 //! The authenticated identity behind a CSB (committee) session.
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{CsbUsername, Locale, trans};
+use crate::{CsbUsername, Locale, trans, utils::PeerIp};
 
 /// The committee member behind a CSB session, recorded on every CSB event so
 /// the audit log can show who triggered it.
@@ -19,10 +21,45 @@ pub enum CsbUser {
     SecurityKey { username: CsbUsername },
 }
 
+/// A committee member and the peer address they act from: what every CSB
+/// event records, so the audit log shows who triggered it and from where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsbActor {
+    pub user: CsbUser,
+    /// The peer address of the request behind the action; `None` when the
+    /// server recorded none, or for an action without a request behind it.
+    pub ip: Option<IpAddr>,
+}
+
+impl CsbActor {
+    pub fn new(user: CsbUser, peer_ip: PeerIp) -> Self {
+        Self {
+            user,
+            ip: peer_ip.0,
+        }
+    }
+
+    /// The peer address as a log field: the address, or `unknown`.
+    pub fn peer_ip(&self) -> PeerIp {
+        PeerIp(self.ip)
+    }
+}
+
+/// A member without a request behind them: fixtures, tests and the like.
+impl From<CsbUser> for CsbActor {
+    fn from(user: CsbUser) -> Self {
+        Self { user, ip: None }
+    }
+}
+
 /// Implemented by the CSB store events, which all record the committee member
-/// that triggered them. Lets the audit log render the user generically.
+/// that triggered them and the address they acted from. Lets the audit log
+/// render both generically.
 pub trait HasCsbUser {
     fn csb_user(&self) -> &CsbUser;
+
+    /// The peer address the member acted from, when the event recorded one.
+    fn peer_ip(&self) -> Option<IpAddr>;
 }
 
 impl CsbUser {

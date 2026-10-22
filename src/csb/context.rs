@@ -3,7 +3,10 @@
 
 use axum::{extract::FromRequestParts, http::request::Parts};
 
-use crate::{AppError, AppRequestState, CsbUser, ElectionConfig, Session, SessionExpiry};
+use crate::{
+    AppError, AppRequestState, CsbActor, CsbUser, ElectionConfig, Session, SessionExpiry,
+    utils::PeerIp,
+};
 
 #[cfg(test)]
 use crate::Locale;
@@ -26,6 +29,8 @@ pub struct CsbContext {
     pub show_success_alert: bool,
     /// Whether the page is part of an already-open overlay (suppresses animation).
     pub overlay_active: bool,
+    /// The peer address of the request, recorded on the CSB events it causes.
+    pub peer_ip: PeerIp,
 }
 
 impl CsbContext {
@@ -37,12 +42,19 @@ impl CsbContext {
             server_name: None,
             show_success_alert: false,
             overlay_active: false,
+            peer_ip: PeerIp(None),
         }
     }
 
-    /// The committee member behind this request, recorded on CSB events.
+    /// The committee member behind this request.
     pub fn user(&self) -> Result<CsbUser, AppError> {
         self.session.require_csb_user()
+    }
+
+    /// The committee member behind this request and the address it came
+    /// from, recorded on CSB events.
+    pub fn actor(&self) -> Result<CsbActor, AppError> {
+        Ok(CsbActor::new(self.user()?, self.peer_ip))
     }
 
     #[cfg(test)]
@@ -79,6 +91,7 @@ impl<S: AppRequestState> FromRequestParts<S> for CsbContext {
 
         context.show_success_alert = crate::success_alert_requested(parts);
         context.overlay_active = crate::overlay_active(parts);
+        context.peer_ip = PeerIp::from_extensions(&parts.extensions);
 
         Ok(context)
     }

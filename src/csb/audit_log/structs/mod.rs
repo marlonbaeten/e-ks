@@ -1,2 +1,2 @@
 mod audit_log_entry;
-pub use audit_log_entry::CsbAuditLogEntry;
+pub use audit_log_entry::{CsbAuditLogEntry, peer_ip_text};

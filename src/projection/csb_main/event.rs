@@ -1,7 +1,9 @@
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CredentialId, CsbUser, Event, HasCsbUser, StreamId,
+    CredentialId, CsbActor, CsbUser, Event, HasCsbUser, StreamId,
     core::constants::DEFAULT_DATE_TIME_FORMAT,
     structs::csb::{
         HearingDetails, HearingModel, Objection, ObjectionId, RegisteredPoliticalGroup,
@@ -11,12 +13,17 @@ use crate::{
 };
 
 /// An event on the global CSB stream: the acting committee member plus what
-/// they did. Every event records its user so the audit log can show who
-/// triggered it.
+/// they did. Every event records its user, and the address they acted from,
+/// so the audit log can show who triggered it.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CsbMainEvent {
     /// The committee member that triggered the event.
     pub user: CsbUser,
+    /// The peer address of the request behind the event. Absent on events
+    /// recorded before it was kept, and when the server recorded none; left
+    /// out of the stored form then, so those events keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<IpAddr>,
     pub action: CsbMainAction,
 }
 
@@ -50,14 +57,23 @@ pub enum CsbMainAction {
 
 impl CsbMainAction {
     /// Attach the acting committee member, producing the event to persist.
-    pub fn by(self, user: CsbUser) -> CsbMainEvent {
-        CsbMainEvent { user, action: self }
+    pub fn by(self, actor: impl Into<CsbActor>) -> CsbMainEvent {
+        let CsbActor { user, ip } = actor.into();
+        CsbMainEvent {
+            user,
+            ip,
+            action: self,
+        }
     }
 }
 
 impl HasCsbUser for CsbMainEvent {
     fn csb_user(&self) -> &CsbUser {
         &self.user
+    }
+
+    fn peer_ip(&self) -> Option<IpAddr> {
+        self.ip
     }
 }
 
@@ -157,6 +173,35 @@ impl Event for CsbMainEvent {
 mod tests {
     use super::*;
     use crate::{Locale, structs::csb::sample_registered_political_group};
+
+    /// An event stored before the peer address was kept has no `ip` field
+    /// and still decodes; one recorded without an address is stored the
+    /// same way, so its bytes (and hash) are unchanged.
+    #[test]
+    fn stored_event_without_peer_address_decodes_and_is_stored_without_one() {
+        let stored = serde_json::json!({ "user": "Developer", "action": "Login" });
+
+        let event: CsbMainEvent = serde_json::from_value(stored.clone()).expect("decodes");
+        assert_eq!(event.peer_ip(), None);
+        assert!(matches!(event.action, CsbMainAction::Login));
+
+        let recorded = CsbMainAction::Login.by(CsbUser::Developer);
+        assert_eq!(serde_json::to_value(&recorded).expect("encodes"), stored);
+    }
+
+    #[test]
+    fn peer_address_is_stored_with_the_event() {
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        let recorded = CsbMainAction::Login.by(CsbActor {
+            user: CsbUser::Developer,
+            ip: Some(ip),
+        });
+
+        let stored = serde_json::to_value(&recorded).expect("encodes");
+        assert_eq!(stored["ip"], serde_json::json!("203.0.113.8"));
+        let event: CsbMainEvent = serde_json::from_value(stored).expect("decodes");
+        assert_eq!(event.peer_ip(), Some(ip));
+    }
 
     #[test]
     fn registered_political_group_events_share_a_category() {

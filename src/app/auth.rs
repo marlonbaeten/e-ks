@@ -1,5 +1,7 @@
 //! The `AuthState` hooks the auth-service invokes on login and logout.
 
+use std::net::IpAddr;
+
 use auth_service::{AuthFailure, AuthState, LoggedOutSession, MessageId, NameId, SubjectId};
 use axum::{
     http::HeaderMap,
@@ -10,11 +12,13 @@ use axum_extra::extract::CookieJar;
 use tracing::{error, info, warn};
 
 use crate::{
-    AppError, AppState, CsbMainAction, Locale, PgEvent, PgStore, Session, SessionUser, StreamId,
+    AppError, AppState, CsbActor, CsbMainAction, Locale, PgEvent, PgStore, Session, SessionUser,
+    StreamId,
     auth::session_extractor::{
         SESSION_COOKIE_NAME, build_removal_cookie, establish_session, user_agent_hash,
     },
     common::{PgIndexPath, SelectElectionPath, auth_failure_response},
+    utils::PeerIp,
 };
 
 impl AppState {
@@ -46,11 +50,14 @@ impl AppState {
     /// CSB main stream for committee sessions, the PG stream otherwise. A
     /// political-group session without an election has no partition to write
     /// to, and the log is the only record.
-    async fn record_logout(&self, session: &Session) {
+    async fn record_logout(&self, session: &Session, peer: Option<IpAddr>) {
         let recorded = match &session.user {
             SessionUser::CentralElectoralCommittee { user, election, .. } => {
                 match self.csb_main_store(*election).await {
-                    Ok(store) => store.update(CsbMainAction::Logout.by(user.clone())).await,
+                    Ok(store) => {
+                        let actor = CsbActor::new(user.clone(), PeerIp(peer));
+                        store.update(CsbMainAction::Logout.by(actor)).await
+                    }
                     Err(err) => Err(err),
                 }
             }
@@ -145,13 +152,14 @@ impl AuthState for AppState {
     async fn logout_session(
         &self,
         jar: CookieJar,
+        peer: Option<IpAddr>,
     ) -> Result<(CookieJar, LoggedOutSession), Response> {
         // Drop the session (if any) and clear the cookie. A failed removal is
         // not a logout: the cookie stays, so the user can retry.
         let ended = match jar.get(SESSION_COOKIE_NAME).map(|c| c.value().to_string()) {
             Some(token) => match self.sessions.remove(&token).await {
                 Ok(Some(session)) => {
-                    self.record_logout(&session).await;
+                    self.record_logout(&session, peer).await;
                     info!(
                         event = "auth.logout",
                         user = ?session.user,

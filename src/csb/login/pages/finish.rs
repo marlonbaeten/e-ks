@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::{
-    AppError, AppRequestState, CsbMainStore, CsbUser, CsbUsername, Form, Locale, Session,
+    AppError, AppRequestState, CsbActor, CsbMainStore, CsbUser, CsbUsername, Form, Locale, Session,
     auth::{
         csb_webauthn::{AssertionError, LoginFailure, VerifiedLogin, verify_login},
         session_extractor::{establish_session, user_agent_hash},
@@ -25,7 +25,7 @@ use crate::{
         index::CsbIndexPath,
         login::{CsbLoginFinishPath, pages::login::login_failed, require_webauthn},
     },
-    utils::peer_ip_label,
+    utils::{PeerIp, peer_ip_label},
 };
 
 /// The ceremony result, as the browser script serialises it.
@@ -102,7 +102,7 @@ async fn establish_committee_session<S: AppRequestState>(
     session.set_user_agent_hash(user_agent_hash(headers));
 
     if !store
-        .record_security_key_login(user, credential_id, sign_count)
+        .record_security_key_login(CsbActor::new(user, PeerIp(peer)), credential_id, sign_count)
         .await?
     {
         let failure = LoginFailure::Rejected {
@@ -174,6 +174,7 @@ mod tests {
                 payload: crate::CsbMainEvent {
                     user: CsbUser::SecurityKey { .. },
                     action: CsbMainAction::SecurityKeyLogin { sign_count: 7, .. },
+                    ..
                 },
                 ..
             }]
@@ -380,7 +381,10 @@ mod tests {
             crate::SESSION_COOKIE_NAME,
             token,
         ));
-        let _ = state.logout_session(jar).await.expect("logout session");
+        let _ = state
+            .logout_session(jar, None)
+            .await
+            .expect("logout session");
 
         let store = state
             .csb_main_store(state.config.default_election)
@@ -392,6 +396,7 @@ mod tests {
                 crate::CsbMainEvent {
                     user: CsbUser::SecurityKey { .. },
                     action: CsbMainAction::Logout,
+                    ..
                 }
             )),
             "logout must be recorded on the CSB main stream"

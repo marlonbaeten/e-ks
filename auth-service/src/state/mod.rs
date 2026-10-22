@@ -13,7 +13,7 @@ use crate::{
 use axum::{http::HeaderMap, response::Response};
 use axum_extra::extract::CookieJar;
 use parking_lot::{Mutex, RwLock};
-use std::sync::Arc;
+use std::{net::IpAddr, sync::Arc};
 use tracing::debug;
 
 /// SAML state shared by the auth-service handlers: configuration, DV/RD keys,
@@ -237,10 +237,12 @@ pub trait AuthState: Clone + Send + Sync + 'static {
     /// the jar with the session cookie cleared, plus what was torn down (see
     /// [`LoggedOutSession`]), which decides whether a `LogoutRequest` is sent to
     /// the RD (eID §7.7.1). A failed invalidation returns the error response
-    /// to send instead: the logout must not look successful.
+    /// to send instead: the logout must not look successful. `peer` is the
+    /// address the logout was requested from, for the application's records.
     fn logout_session(
         &self,
         jar: CookieJar,
+        peer: Option<IpAddr>,
     ) -> impl std::future::Future<
         Output = std::result::Result<(CookieJar, LoggedOutSession), Response>,
     > + Send;

@@ -356,7 +356,11 @@ The CSB section has two projections of its own on the shared store machinery
   is decrypted, so monitoring works without touching any political group's
   data.
 - **`audit_log`**: the CSB audit log, a read view over either the main
-  committee stream or a single imported stream. Every request to the BRP is
+  committee stream or a single imported stream. Every CSB event records the
+  committee member that triggered it and the peer address (the TCP peer, or
+  the client a listed proxy announced) of the request behind it, which the
+  log shows and searches on; events recorded before the address was kept,
+  and those without a request behind them, show none. Every request to the BRP is
   on the stream as a `CsbAction::BrpLookup` (the candidates it was for, the
   request as sent, and the burgerservicenummers returned or the error), ahead
   of the `BrpPersonChecked` findings it led to; the detail page sets a

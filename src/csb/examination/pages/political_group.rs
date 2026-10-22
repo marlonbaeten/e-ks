@@ -34,7 +34,6 @@ use crate::{
         persons::PersonId,
         problems::AllProblems,
     },
-    utils::PeerIp,
 };
 
 #[derive(Template)]
@@ -157,10 +156,9 @@ fn candidate_lists(
 pub async fn start_brp_check<S: AppRequestState>(
     path: CsbBrpCheckPath,
     State(state): State<S>,
-    peer_ip: PeerIp,
     store: CsbStore,
 ) -> Result<Response, AppError> {
-    do_brp_verification(&store, state.brp_client(), peer_ip).await?;
+    do_brp_verification(&store, state.brp_client()).await?;
 
     Ok(redirect_success(CsbPoliticalGroupPath {
         stream_id: path.stream_id,
@@ -411,14 +409,9 @@ mod tests {
         let (store, _) = store_with_a_candidate();
         let stream_id = store.stream_id;
 
-        let response = start_brp_check(
-            CsbBrpCheckPath { stream_id },
-            State(state),
-            PeerIp(None),
-            store.clone(),
-        )
-        .await
-        .unwrap();
+        let response = start_brp_check(CsbBrpCheckPath { stream_id }, State(state), store.clone())
+            .await
+            .unwrap();
 
         assert!(
             response.status().is_redirection(),

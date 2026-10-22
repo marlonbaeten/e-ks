@@ -119,6 +119,7 @@ fields:
   details: Details
   event: Event
   event_id: "#"
+  ip: IP address
   stream: Stream
   subject_id: Subject ID
   timestamp: Timestamp

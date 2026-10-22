@@ -48,6 +48,7 @@
             <th scope="col">{{ "audit_log.fields.timestamp"|trans }}</th>
             <th scope="col">{{ "audit_log.fields.stream"|trans }}</th>
             <th scope="col">{{ "audit_log.fields.user"|trans }}</th>
+            <th scope="col">{{ "audit_log.fields.ip"|trans }}</th>
             <th scope="col">{{ "audit_log.fields.event"|trans }}</th>
             <th></th>
           </tr>
@@ -59,6 +60,7 @@
               <td>{{ entry.created_at|datetime_seconds }}</td>
               <td>{{ entry.stream_label }}</td>
               <td>{{ entry.user }}</td>
+              <td>{{ entry.ip }}</td>
               <td>{{ entry.description }}</td>
               <td>
                 <a href="{{ entry.detail_path_with_return(return_url.as_str() ) }}">

@@ -71,7 +71,7 @@ pub async fn add_objection_submit(
         Err(form) => return Ok(render(context, &query, form, None)),
     };
     main_store
-        .update(CsbMainAction::AddObjection(objection).by(context.user()?))
+        .update(CsbMainAction::AddObjection(objection).by(context.actor()?))
         .await?;
     Ok(redirect_success(CsbFinalisePath))
 }
@@ -104,7 +104,7 @@ pub async fn update_objection_submit(
         Err(form) => return Ok(render(context, &query, form, Some(current))),
     };
     main_store
-        .update(CsbMainAction::UpdateObjection(objection).by(context.user()?))
+        .update(CsbMainAction::UpdateObjection(objection).by(context.actor()?))
         .await?;
     Ok(redirect_success(CsbFinalisePath))
 }
@@ -117,7 +117,7 @@ pub async fn delete_objection(
     // Deleting an objection that is already gone is a stale form, not a change.
     main_store.get_objection(id)?;
     main_store
-        .update(CsbMainAction::DeleteObjection(id).by(context.user()?))
+        .update(CsbMainAction::DeleteObjection(id).by(context.actor()?))
         .await?;
     Ok(redirect_success(CsbFinalisePath))
 }

@@ -137,7 +137,7 @@ impl ListNumbering {
     ) -> Result<(), AppError> {
         if !self.is_complete() {
             main_store
-                .update(CsbMainAction::UpdateListOrder(self.stream_ids()).by(context.user()?))
+                .update(CsbMainAction::UpdateListOrder(self.stream_ids()).by(context.actor()?))
                 .await?;
 
             self.groups

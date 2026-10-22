@@ -8,8 +8,8 @@ use axum::{
 };
 
 use crate::{
-    AppError, AppRequestState, CsbAction, CsbStoreData, CsbStream, CsbUser, PgStore, Session,
-    StreamId, store::StoreRegistry,
+    AppError, AppRequestState, CsbAction, CsbActor, CsbStoreData, CsbStream, CsbUser, PgStore,
+    Session, StreamId, store::StoreRegistry, utils::PeerIp,
 };
 
 /// A CSB stream paired with the committee member acting on it in this request.
@@ -26,7 +26,7 @@ use crate::{
 #[derive(Clone)]
 pub struct CsbStore {
     stream: CsbStream,
-    user: CsbUser,
+    actor: CsbActor,
 }
 
 impl std::ops::Deref for CsbStore {
@@ -38,20 +38,30 @@ impl std::ops::Deref for CsbStore {
 }
 
 impl CsbStore {
-    /// Bind `user` to `stream` as the member acting on it.
-    pub fn acting_as(stream: CsbStream, user: CsbUser) -> Self {
-        Self { stream, user }
+    /// Bind `actor` to `stream` as the member acting on it, and the address
+    /// they act from.
+    pub fn acting_as(stream: CsbStream, actor: impl Into<CsbActor>) -> Self {
+        Self {
+            stream,
+            actor: actor.into(),
+        }
     }
 
     /// The committee member acting on the stream.
     pub fn user(&self) -> &CsbUser {
-        &self.user
+        &self.actor.user
+    }
+
+    /// The committee member acting on the stream and the address they act
+    /// from, as recorded on every event.
+    pub fn actor(&self) -> &CsbActor {
+        &self.actor
     }
 
     /// Persist an action on the stream, recorded as triggered by the acting
     /// committee member.
     pub async fn update(&self, action: CsbAction) -> Result<(), AppError> {
-        self.stream.update(action.by(self.user.clone())).await
+        self.stream.update(action.by(self.actor.clone())).await
     }
 
     /// [`Self::update`] for an action decided on the projection it lands on;
@@ -61,7 +71,7 @@ impl CsbStore {
         mut decide: impl FnMut(&CsbStoreData) -> Option<CsbAction>,
     ) -> Result<bool, AppError> {
         self.stream
-            .update_when(|data| decide(data).map(|action| action.by(self.user.clone())))
+            .update_when(|data| decide(data).map(|action| action.by(self.actor.clone())))
             .await
     }
 
@@ -72,7 +82,7 @@ impl CsbStore {
 
     /// The stream named by the `stream_id` path parameter, looked up in
     /// `registry` under the session's election and bound to its committee
-    /// member. A deleted stream is not found.
+    /// member and the request's peer address. A deleted stream is not found.
     pub(crate) async fn from_registry<S: AppRequestState>(
         parts: &mut Parts,
         state: &S,
@@ -90,7 +100,10 @@ impl CsbStore {
 
         let session = Session::from_request_parts(parts, state).await?;
         let election = session.require_current_election()?;
-        let user = session.require_csb_user()?;
+        let actor = CsbActor::new(
+            session.require_csb_user()?,
+            PeerIp::from_extensions(&parts.extensions),
+        );
 
         let stream = registry.get_store(stream_id, election).await?;
 
@@ -98,7 +111,7 @@ impl CsbStore {
             return Err(AppError::NotFound("Stream deleted".to_string()));
         }
 
-        Ok(Self::acting_as(stream, user))
+        Ok(Self::acting_as(stream, actor))
     }
 
     #[cfg(test)]
@@ -126,16 +139,22 @@ impl<S: AppRequestState> FromRequestParts<S> for CsbStore {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, SocketAddr};
+
     use super::*;
     use axum::{
         Router,
         body::Body,
+        extract::ConnectInfo,
         http::{Request, StatusCode},
         routing::get,
     };
     use tower::ServiceExt;
 
-    use crate::{AppState, CsbStoreData, ElectionConfig, HasCsbUser, PgStoreData};
+    use crate::{
+        AppState, CsbStoreData, ElectionConfig, HasCsbUser, PgStoreData,
+        test_utils::response_body_string,
+    };
 
     /// Persist a CSB stream carrying a single import event and return its id.
     async fn seed_csb_store(state: &AppState, election: ElectionConfig) -> StreamId {
@@ -310,7 +329,67 @@ mod tests {
         let events = store.snapshot().events.clone();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload.csb_user(), &user);
+        assert_eq!(events[0].payload.peer_ip(), None);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_records_the_address_the_user_acts_from() -> Result<(), AppError> {
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+        let actor = CsbActor {
+            user: CsbUser::new_test(),
+            ip: Some(ip),
+        };
+        let store = CsbStore::acting_as(CsbStream::new_for_test(), actor);
+
+        store.update(CsbAction::SetFinished(true)).await?;
+        store
+            .update_when(|_| Some(CsbAction::SetFinished(false)))
+            .await?;
+
+        let events = store.snapshot().events.clone();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.payload.peer_ip() == Some(ip))
+        );
+
+        Ok(())
+    }
+
+    /// The extractor binds the peer address the server recorded on the
+    /// request, so every event of the request names it; a request without
+    /// one (as in these tests) binds none.
+    #[tokio::test]
+    async fn the_extractor_binds_the_requests_peer_address() {
+        let state = AppState::new_for_tests().await;
+        let stream_id = seed_csb_store(&state, ElectionConfig::EK27).await;
+        let app = Router::new()
+            .route(
+                "/csb/examination/{stream_id}",
+                get(|store: CsbStore| async move { store.actor().peer_ip().to_string() }),
+            )
+            .with_state(state);
+
+        for (peer, expected) in [(Some("203.0.113.8:4000"), "203.0.113.8"), (None, "unknown")] {
+            let mut request = Request::builder()
+                .uri(format!("/csb/examination/{stream_id}"))
+                .body(Body::empty())
+                .unwrap();
+            let mut session = Session::new_test_committee();
+            session.set_test_election(ElectionConfig::EK27);
+            request.extensions_mut().insert(session);
+            if let Some(peer) = peer {
+                let addr: SocketAddr = peer.parse().unwrap();
+                request.extensions_mut().insert(ConnectInfo(addr));
+            }
+
+            let response = app.clone().oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_body_string(response).await, expected);
+        }
     }
 }

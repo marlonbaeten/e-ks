@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{
-    AppError, CredentialId, CsbMainStore, CsbUser, Scope, StreamId,
+    AppError, CredentialId, CsbActor, CsbMainStore, Scope, StreamId,
     auth::csb_webauthn::sign_count_advanced,
     store::{StoreData, StoreEvent},
     structs::csb::{HearingDetails, HearingModel, Objection, RegisteredPoliticalGroup},
@@ -43,7 +43,7 @@ impl CsbMainStore {
     /// what is recorded, or the stream kept moving: the login fails.
     pub async fn record_security_key_login(
         &self,
-        user: CsbUser,
+        actor: CsbActor,
         credential_id: CredentialId,
         sign_count: u32,
     ) -> Result<bool, AppError> {
@@ -54,7 +54,7 @@ impl CsbMainStore {
                     credential_id: credential_id.clone(),
                     sign_count,
                 }
-                .by(user.clone())
+                .by(actor.clone())
             })
         })
         .await

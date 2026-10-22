@@ -11,7 +11,6 @@ use crate::{
         pre_submission::pages::{CsbPreSubmissionGroupPath, CsbPreSubmissionImportPath},
     },
     filters, redirect_success,
-    utils::PeerIp,
 };
 
 #[derive(Template)]
@@ -52,7 +51,6 @@ pub async fn import_submit<S: AppRequestState>(
     _: CsbPreSubmissionImportPath,
     State(state): State<S>,
     context: CsbContext,
-    peer_ip: PeerIp,
     Form(form): Form<ImportForm>,
 ) -> Result<Response, AppError> {
     let hash = form.hash.clone();
@@ -60,8 +58,7 @@ pub async fn import_submit<S: AppRequestState>(
         &state,
         state.pre_submission_store_registry(),
         form,
-        context.user()?,
-        peer_ip,
+        context.actor()?,
         context.election,
         context.session.locale,
     )
@@ -105,7 +102,6 @@ mod tests {
             CsbPreSubmissionImportPath,
             State(state.clone()),
             CsbContext::new_test(),
-            PeerIp(None),
             Form(ImportForm {
                 hash: hash.to_string(),
                 confirmed_hash: confirmed_hash.map(str::to_string),

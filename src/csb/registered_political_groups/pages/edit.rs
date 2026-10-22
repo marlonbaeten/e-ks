@@ -97,7 +97,7 @@ pub async fn add_submit(
         Err(form) => return Ok(render(context, &query, form, None)),
     };
     main_store
-        .update(CsbMainAction::CreateRegisteredPoliticalGroup(group).by(context.user()?))
+        .update(CsbMainAction::CreateRegisteredPoliticalGroup(group).by(context.actor()?))
         .await?;
     Ok(redirect_success(CsbRegisteredPoliticalGroupsPath))
 }
@@ -131,7 +131,7 @@ pub async fn edit_submit(
         Err(form) => return Ok(render(context, &query, form, Some(current))),
     };
     main_store
-        .update(CsbMainAction::UpdateRegisteredPoliticalGroup(group).by(context.user()?))
+        .update(CsbMainAction::UpdateRegisteredPoliticalGroup(group).by(context.actor()?))
         .await?;
     Ok(redirect_success(CsbRegisteredPoliticalGroupsPath))
 }
